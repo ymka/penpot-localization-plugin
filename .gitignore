@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+translations.local.json
+private-translations/
+artifacts/

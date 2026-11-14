@@ -1,0 +1,7 @@
+{
+  "version": 2,
+  "name": "Penpot Localization",
+  "description": "Switch design text between English, Spanish, French, and Chinese using translation keys.",
+  "code": "plugin.js",
+  "permissions": ["content:read", "content:write", "allow:localstorage"]
+}
