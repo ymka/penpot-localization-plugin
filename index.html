@@ -21,10 +21,14 @@
     button { margin-top: 10px; cursor: pointer; }
     #apply { background: light-dark(#315bce, #9ab7ff); border-color: light-dark(#315bce, #9ab7ff); color: light-dark(#fff, #111a2e); font-weight: 600; }
     #restore { font-weight: 600; }
+    .check-control { display: flex; gap: 9px; align-items: flex-start; margin-top: 14px; }
+    .check-control input { margin: 2px 0 0; }
+    .check-control label { display: inline; margin: 0; }
     :focus-visible { outline: 2px solid light-dark(#315bce, #9ab7ff); outline-offset: 2px; }
     select:disabled, input:disabled, button:disabled { opacity: 0.55; cursor: default; }
     #status { margin-top: 16px; padding: 12px; border-radius: 6px; background: light-dark(#f3f5f8, #30343c); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; min-height: 54px; }
     #status.error { color: light-dark(#a32424, #ffaaa7); }
+    #status.warning { color: light-dark(#704500, #ffd27a); }
     small { display: block; margin-top: 12px; color: light-dark(#666a74, #b1b4bd); line-height: 1.45; }
     code { font: 12px ui-monospace, SFMono-Regular, monospace; }
   </style>
@@ -58,9 +62,14 @@
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
   </div>
   <small id="language-help">Changing language applies immediately. Reopening only restores your choices. Use the button to apply again, including to newly added text.</small>
+  <div class="check-control">
+    <input id="mirror-rtl-layout" type="checkbox" aria-describedby="rtl-help">
+    <label for="mirror-rtl-layout">Mirror RTL layout</label>
+  </div>
+  <small id="rtl-help">Language changes do not alter layout mirroring. Set this checkbox, then use Apply to mirror supported content or restore its baseline in scope. Grid and component layout subtrees are left unchanged.</small>
   <button id="apply" type="button" disabled>Apply to current page</button>
   <button id="restore" type="button" aria-describedby="recovery-help" disabled>Restore current page</button>
-  <small id="recovery-help">Restore returns text changed by this plugin session to its first observed value. External edits and missing layers are reported and left unchanged. Closing the plugin clears this recovery journal.</small>
+  <small id="recovery-help">Restore returns session text and durable RTL style/layout changes to their baselines. External edits and missing layers are reported and left unchanged. Closing the plugin clears only text recovery.</small>
 
   <div id="status" role="status" aria-live="polite">Choose a translation JSON file to get started.</div>
   <small>Rename text layers to translation keys, for example <code>i18n.login.title</code>. Untagged text is left unchanged. Layers with mixed per-character styles are skipped to preserve their formatting.</small>
@@ -76,6 +85,7 @@
     const applyButton = document.getElementById("apply");
     const restoreButton = document.getElementById("restore");
     const forgetButton = document.getElementById("forget");
+    const mirrorRtlLayout = document.getElementById("mirror-rtl-layout");
     const MAX_BYTES = 1024 * 1024;
     const languageNames = {
       AF: "Afrikaans",
@@ -146,14 +156,47 @@
     let pendingApply = null;
     let restoreRequestId = 0;
     let pendingRestore = null;
+    let recoveryRequestId = 0;
+    let pendingRecovery = null;
     let restoreAvailable = false;
     let failedApply = null;
     let restoreApplyFocus = false;
     let restoreRestoreFocus = false;
+    const LAYOUT_FAILURE_LABELS = {
+      alignment: "alignment",
+      constraints: "constraints",
+      flexDirection: "flex direction",
+      margins: "margins",
+      metadata: "recovery metadata",
+      padding: "padding",
+      position: "position",
+      target: "shape access/readback"
+    };
 
-    function setStatus(text, isError = false) {
+    function setStatus(text, tone = "normal") {
       status.textContent = text;
-      status.classList.toggle("error", isError);
+      status.classList.toggle("error", tone === true || tone === "error");
+      status.classList.toggle("warning", tone === "warning");
+    }
+
+    function validLayoutFailureReasons(value, expectedTotal) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+      const expectedKeys = Object.keys(LAYOUT_FAILURE_LABELS);
+      const keys = Object.keys(value);
+      if (keys.length !== expectedKeys.length
+          || keys.some(key => !Object.prototype.hasOwnProperty.call(LAYOUT_FAILURE_LABELS, key))) {
+        return false;
+      }
+      const counts = expectedKeys.map(key => value[key]);
+      return counts.every(count => Number.isSafeInteger(count) && count >= 0)
+        && counts.reduce((sum, count) => sum + count, 0) === expectedTotal;
+    }
+
+    function formatLayoutFailureReasons(reasons) {
+      return Object.keys(LAYOUT_FAILURE_LABELS)
+        .filter(key => reasons[key] > 0)
+        .map(key => `${LAYOUT_FAILURE_LABELS[key]}: ${reasons[key]}`)
+        .join("; ");
     }
 
     function validateDictionary(data) {
@@ -200,6 +243,7 @@
       chooseFileButton.disabled = busy;
       languageSelect.disabled = busy || !translations;
       scopeSelect.disabled = busy;
+      mirrorRtlLayout.disabled = busy || !fileId;
       applyButton.disabled = busy || !hasSelection;
       applyButton.textContent = pendingApply ? "Applying…" : needsRetry ? "Try again"
         : scopeSelect.value === "file" ? "Apply to all pages" : "Apply to current page";
@@ -359,7 +403,44 @@
         showStorageError(action, error.message);
       } finally {
         if (action !== "save") setLoading(false);
+        if (action === "load" && fileId && result.ok === true) {
+          requestRecoveryStatus();
+        }
       }
+    }
+
+    function requestRecoveryStatus() {
+      if (!fileId) return;
+      pendingRecovery = { requestId: ++recoveryRequestId, scope: scopeSelect.value };
+      updateControls();
+      try {
+        parent.postMessage({
+          type: "recovery-status-request",
+          requestId: pendingRecovery.requestId,
+          fileId,
+          scope: pendingRecovery.scope
+        }, "*");
+      } catch (error) {
+        pendingRecovery = null;
+        updateControls();
+      }
+    }
+
+    function receiveRecoveryStatus(result) {
+      if (!pendingRecovery || result.requestId !== pendingRecovery.requestId) return;
+      const request = pendingRecovery;
+      pendingRecovery = null;
+      if (request.scope === scopeSelect.value && result.ok === true
+          && typeof result.restoreAvailable === "boolean"
+          && typeof result.layoutMirrored === "boolean"
+          && typeof result.layoutStateComplete === "boolean") {
+        restoreAvailable = result.restoreAvailable;
+        if (result.layoutStateComplete === true
+            && typeof result.layoutMirrored === "boolean") {
+          mirrorRtlLayout.checked = result.layoutMirrored;
+        }
+      }
+      updateControls();
     }
 
     async function importTranslations() {
@@ -399,12 +480,17 @@
       if (imported) applyLanguage(importContext && importContext.pageId);
     }
 
-    function applyLanguage(pageId = null) {
+    function applyLanguage(pageId = null, manualApply = false) {
       if (loading || pendingApply || pendingRestore
           || !translations || !languageSelect.value || !fileId) return;
+      pendingRecovery = null;
+      const retry = manualApply && matchesCurrentChoice(failedApply) ? failedApply : null;
       pendingApply = {
         requestId: ++applyRequestId, language: languageSelect.value,
-        scope: scopeSelect.value, translations, pageId
+        scope: scopeSelect.value, translations, pageId,
+        updateRtlLayout: retry ? retry.updateRtlLayout : manualApply,
+        mirrorRtlLayout: retry ? retry.mirrorRtlLayout
+          : mirrorRtlLayout.checked
       };
       updateControls();
       setStatus(`Applying ${languageSelect.value}…`);
@@ -416,6 +502,8 @@
           fileId,
           language: pendingApply.language,
           scope: pendingApply.scope,
+          updateRtlLayout: pendingApply.updateRtlLayout,
+          mirrorRtlLayout: pendingApply.mirrorRtlLayout,
           translations: pendingApply.translations,
           ...(pendingApply.pageId ? { pageId: pendingApply.pageId } : {})
         }, "*");
@@ -448,11 +536,30 @@
           result.skipped,
           result.failed,
           result.failedPages,
-          result.conflicts
+          result.conflicts,
+          result.styled,
+          result.mirrored,
+          result.layoutSkipped,
+          result.layoutUnsupported,
+          result.layoutSubtreesSkipped,
+          result.styleConflicts,
+          result.styleMetadataConflicts,
+          result.layoutConflicts,
+          result.layoutMetadataConflicts,
+          result.styleFailed,
+          result.layoutFailed
         ];
         if (result.language !== pendingApply.language
             || counts.some(count => !Number.isSafeInteger(count) || count < 0)
+            || result.layoutUnsupported + result.layoutSubtreesSkipped !== result.layoutSkipped
+            || result.styleMetadataConflicts > result.styleConflicts
+            || result.layoutMetadataConflicts > result.layoutConflicts
+            || result.styleFailed + result.layoutFailed > result.failed
+            || !validLayoutFailureReasons(result.layoutFailureReasons, result.layoutFailed)
             || !Array.isArray(result.missing) || result.missing.some(key => typeof key !== "string")
+            || typeof result.rtl !== "boolean"
+            || typeof result.layoutMirrored !== "boolean"
+            || typeof result.layoutStateComplete !== "boolean"
             || typeof result.historyFailed !== "boolean"
             || typeof result.restoreAvailable !== "boolean") {
           throw new Error("Invalid localization result. Check the design before retrying.");
@@ -464,18 +571,38 @@
         ];
         if (result.missing.length) parts.push(`Missing translation keys: ${result.missing.join(", ")}`);
         if (result.skipped) parts.push(`${result.skipped} mixed-style layer(s) skipped to preserve formatting.`);
-        if (result.failed) parts.push(`${result.failed} layer(s) could not be updated.`);
+        if (result.styled) parts.push(`${result.styled} text layer(s) had RTL direction or alignment updated.`);
+        if (result.mirrored) parts.push(`${result.mirrored} layout shape(s) were mirrored or returned to their baseline.`);
+        if (result.layoutSubtreesSkipped) parts.push(`${result.layoutSubtreesSkipped} component/grid layout subtree(s) were left unchanged.`);
+        if (result.layoutUnsupported) parts.push(`${result.layoutUnsupported} unsupported layout target(s) were left unchanged.`);
+        if (result.styleMetadataConflicts) parts.push(`${result.styleMetadataConflicts} unreadable RTL text-style metadata record(s) were left unchanged.`);
+        if (result.layoutMetadataConflicts) parts.push(`${result.layoutMetadataConflicts} unreadable RTL layout metadata record(s) were left unchanged.`);
+        const externalStyleConflicts = result.styleConflicts - result.styleMetadataConflicts;
+        const externalLayoutConflicts = result.layoutConflicts - result.layoutMetadataConflicts;
+        if (externalStyleConflicts) parts.push(`${externalStyleConflicts} externally changed text style(s) were left unchanged.`);
+        if (externalLayoutConflicts) parts.push(`${externalLayoutConflicts} externally changed layout shape(s) were left unchanged.`);
+        if (result.styleFailed) parts.push(`${result.styleFailed} RTL text-style property update(s) failed.`);
+        if (result.layoutFailed) parts.push(`${result.layoutFailed} layout property update(s) failed: ${formatLayoutFailureReasons(result.layoutFailureReasons)}.`);
+        const otherFailed = result.failed - result.styleFailed - result.layoutFailed;
+        if (otherFailed) parts.push(`${otherFailed} other layer or operation update(s) failed.`);
         if (result.failedPages) parts.push(`${result.failedPages} page(s) could not be inspected.`);
         if (result.conflicts) parts.push(`${result.conflicts} layer(s) changed while the operation was being prepared and were left unchanged.`);
         if (result.historyFailed) parts.push("Penpot could not finish the grouped history block. Inspect undo history before continuing.");
-        const incomplete = result.failed > 0 || result.failedPages > 0
+        const blockingFailure = otherFailed > 0 || result.failedPages > 0
           || result.conflicts > 0 || result.historyFailed;
-        if (incomplete) {
+        const warning = result.skipped > 0 || result.layoutSkipped > 0
+          || result.missing.length > 0 || result.styleConflicts > 0
+          || result.layoutConflicts > 0 || result.styleFailed > 0
+          || result.layoutFailed > 0;
+        if (blockingFailure) {
           failedApply = pendingApply;
         } else {
           failedApply = null;
+          if (pendingApply.updateRtlLayout && result.layoutStateComplete) {
+            mirrorRtlLayout.checked = result.layoutMirrored;
+          }
         }
-        setStatus(parts.join("\n"), incomplete || result.skipped > 0 || result.missing.length > 0);
+        setStatus(parts.join("\n"), blockingFailure ? "error" : warning ? "warning" : "normal");
       } catch (error) {
         failedApply = pendingApply;
         setStatus(error.message, true);
@@ -487,9 +614,10 @@
 
     function restoreLocalization() {
       if (loading || pendingApply || pendingRestore || !fileId || !restoreAvailable) return;
+      pendingRecovery = null;
       pendingRestore = { requestId: ++restoreRequestId, scope: scopeSelect.value };
       updateControls();
-      setStatus("Restoring text changed during this plugin session…");
+      setStatus("Restoring eligible text, RTL styles, and mirrored layout…");
       let sent = false;
       try {
         parent.postMessage({
@@ -519,9 +647,21 @@
           setStatus(typeof result.error === "string" ? result.error : "Restore failed.", true);
           return;
         }
-        const counts = [result.pageCount, result.targeted, result.restored, result.skipped,
-          result.conflicts, result.missingTargets, result.failed];
+        const counts = [result.pageCount, result.failedPages, result.targeted,
+          result.restored, result.skipped,
+          result.conflicts, result.missingTargets, result.failed, result.stylesRestored,
+          result.layoutsRestored, result.layoutSkipped, result.styleConflicts,
+          result.layoutConflicts, result.layoutUnsupported, result.layoutSubtreesSkipped,
+          result.styleMetadataConflicts, result.layoutMetadataConflicts,
+          result.metadataConflicts, result.styleFailed, result.layoutFailed];
         if (counts.some(count => !Number.isSafeInteger(count) || count < 0)
+            || result.layoutUnsupported + result.layoutSubtreesSkipped !== result.layoutSkipped
+            || result.styleMetadataConflicts > result.styleConflicts
+            || result.layoutMetadataConflicts > result.layoutConflicts
+            || result.styleFailed + result.layoutFailed > result.failed
+            || !validLayoutFailureReasons(result.layoutFailureReasons, result.layoutFailed)
+            || typeof result.layoutMirrored !== "boolean"
+            || typeof result.layoutStateComplete !== "boolean"
             || typeof result.historyFailed !== "boolean"
             || typeof result.restoreAvailable !== "boolean") {
           throw new Error("Invalid restore result. Check the design before retrying.");
@@ -531,14 +671,37 @@
           `Restored ${result.restored} text layer(s) across ${result.pageCount} page(s).`,
           `${result.targeted} session recovery target(s) found.`
         ];
+        if (result.stylesRestored) parts.push(`Restored RTL styling on ${result.stylesRestored} text layer(s).`);
+        if (result.layoutsRestored) parts.push(`Restored ${result.layoutsRestored} mirrored layout shape(s).`);
+        if (result.failedPages) parts.push(`${result.failedPages} page(s) could not be inspected.`);
+        if (result.layoutSubtreesSkipped) parts.push(`${result.layoutSubtreesSkipped} component/grid layout subtree(s) were left unchanged.`);
+        if (result.layoutUnsupported) parts.push(`${result.layoutUnsupported} unsupported layout target(s) were left unchanged.`);
+        if (result.styleMetadataConflicts) parts.push(`${result.styleMetadataConflicts} unreadable RTL text-style metadata record(s) were left unchanged.`);
+        if (result.layoutMetadataConflicts) parts.push(`${result.layoutMetadataConflicts} unreadable RTL layout metadata record(s) were left unchanged.`);
+        if (result.metadataConflicts) parts.push(`${result.metadataConflicts} unreadable RTL recovery metadata record(s) were left unchanged.`);
+        const externalStyleConflicts = result.styleConflicts - result.styleMetadataConflicts;
+        const externalLayoutConflicts = result.layoutConflicts - result.layoutMetadataConflicts;
+        if (externalStyleConflicts) parts.push(`${externalStyleConflicts} externally changed text style(s) left unchanged.`);
+        if (externalLayoutConflicts) parts.push(`${externalLayoutConflicts} externally changed layout shape(s) left unchanged.`);
         if (result.conflicts) parts.push(`${result.conflicts} externally changed layer(s) left unchanged.`);
         if (result.missingTargets) parts.push(`${result.missingTargets} recovery target(s) could not be restored because the corresponding layer(s) were deleted outside the plugin or otherwise missing.`);
         if (result.skipped) parts.push(`${result.skipped} mixed-style layer(s) skipped to preserve formatting.`);
-        if (result.failed) parts.push(`${result.failed} layer(s) could not be restored.`);
+        if (result.styleFailed) parts.push(`${result.styleFailed} RTL text-style property restore(s) failed.`);
+        if (result.layoutFailed) parts.push(`${result.layoutFailed} layout property restore(s) failed: ${formatLayoutFailureReasons(result.layoutFailureReasons)}.`);
+        const otherFailed = result.failed - result.styleFailed - result.layoutFailed;
+        if (otherFailed) parts.push(`${otherFailed} other layer or operation restore(s) failed.`);
         if (result.historyFailed) parts.push("Penpot could not finish the grouped history block. Inspect undo history before continuing.");
-        const incomplete = result.conflicts > 0 || result.missingTargets > 0
-          || result.skipped > 0 || result.failed > 0 || result.historyFailed;
-        setStatus(parts.join("\n"), incomplete);
+        const warning = result.conflicts > 0 || result.styleConflicts > 0
+          || result.layoutConflicts > 0 || result.missingTargets > 0
+          || result.skipped > 0 || result.layoutSkipped > 0
+          || result.metadataConflicts > 0 || result.styleFailed > 0
+          || result.layoutFailed > 0;
+        const blockingFailure = otherFailed > 0 || result.failedPages > 0
+          || result.historyFailed;
+        if (!blockingFailure && result.layoutStateComplete) {
+          mirrorRtlLayout.checked = result.layoutMirrored;
+        }
+        setStatus(parts.join("\n"), blockingFailure ? "error" : warning ? "warning" : "normal");
       } catch (error) {
         setStatus(error.message, true);
       } finally {
@@ -558,12 +721,19 @@
     applyButton.addEventListener("click", () => {
       if (applyButton.disabled) return;
       restoreApplyFocus = document.activeElement === applyButton;
-      applyLanguage();
+      applyLanguage(null, true);
     });
     restoreButton.addEventListener("click", () => {
       if (restoreButton.disabled) return;
       restoreRestoreFocus = document.activeElement === restoreButton;
       restoreLocalization();
+    });
+    mirrorRtlLayout.addEventListener("change", () => {
+      if (loading || pendingApply || pendingRestore || !fileId) return;
+      failedApply = null;
+      if (translations && languageSelect.value) {
+        setStatus("RTL layout option changed. Apply the selected language to update this scope.");
+      }
     });
     forgetButton.addEventListener("click", () => {
       if (loading || pendingApply || pendingRestore || !fileId) return;
@@ -573,6 +743,7 @@
     scopeSelect.addEventListener("change", () => {
       if (loading || pendingApply || pendingRestore) return;
       updateControls();
+      requestRecoveryStatus();
       if (!translations) return;
       if (!languageSelect.value) setStatus("Scope changed. Select a language to update the design.");
       else setStatus("Scope changed. Apply the selected language to this scope.");
@@ -594,6 +765,10 @@
       }
       if (result && result.type === "design-context-result") {
         receiveDesignContext(result);
+        return;
+      }
+      if (result && result.type === "recovery-status-result") {
+        receiveRecoveryStatus(result);
         return;
       }
       if (result && result.type === "restore-result") {

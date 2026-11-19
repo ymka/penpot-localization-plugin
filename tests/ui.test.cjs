@@ -12,11 +12,18 @@ let nextFixtureId = 0;
 
 async function ui(data, options = {}) {
   const elements = new Map();
-  for (const id of ['language', 'scope', 'status', 'translation-file', 'choose-file', 'source', 'apply', 'restore', 'forget', 'remember-status']) {
+  for (const id of ['language', 'scope', 'status', 'translation-file', 'choose-file', 'source',
+    'apply', 'restore', 'forget', 'remember-status', 'mirror-rtl-layout']) {
+    const classes = new Set();
     elements.set(id, { value: id === 'scope' ? defaultScope : '', disabled: false,
+      checked: false,
       hidden: new RegExp(`<[^>]+id="${id}"[^>]*\\bhidden\\b`).test(html),
       clicks: 0, click() { this.clicks++; },
-      textContent: id === 'source' ? 'Source: no file selected' : '', files: [], children: [], replaceChildren(...options) { this.children = options; }, classList: { toggle() {} }, listeners: {},
+      textContent: id === 'source' ? 'Source: no file selected' : '', files: [], children: [], replaceChildren(...options) { this.children = options; },
+      classList: {
+        toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
+        contains(name) { return classes.has(name); }
+      }, listeners: {},
       addEventListener(name, fn) { this.listeners[name] = fn; } });
   }
   const fileInput = elements.get('translation-file');
@@ -31,6 +38,8 @@ async function ui(data, options = {}) {
   const messages = [];
   const storageRequests = [];
   const contextRequests = [];
+  const preferenceRequests = [];
+  const recoveryRequests = [];
   let receive;
   const parent = { postMessage(msg) {
     const message = JSON.parse(JSON.stringify(msg));
@@ -42,6 +51,8 @@ async function ui(data, options = {}) {
       if (options.failContextSend) throw new Error('Cannot post message');
       contextRequests.push(message);
     }
+    else if (message.type === 'rtl-preference-request') preferenceRequests.push(message);
+    else if (message.type === 'recovery-status-request') recoveryRequests.push(message);
     else {
       if (options.failStorageSend === message.action) throw new Error('SANITIZED transport details');
       storageRequests.push(message);
@@ -96,6 +107,7 @@ async function ui(data, options = {}) {
       else if (options.holdApplyReplies && data.type === 'localization-result') options.holdApplyReplies.push(data);
       else if (options.holdRestoreReplies && data.type === 'restore-result') options.holdRestoreReplies.push(data);
       else if (options.holdContextReplies && data.type === 'design-context-result') options.holdContextReplies.push(data);
+      else if (options.holdRecoveryReplies && data.type === 'recovery-status-result') options.holdRecoveryReplies.push(data);
       else queueMicrotask(() => events.message({ source: parent, data: JSON.parse(JSON.stringify(data)) }));
     } }
   };
@@ -122,7 +134,8 @@ async function ui(data, options = {}) {
   });
   vm.runInContext(script, context);
   await new Promise(resolve => setImmediate(resolve));
-  const app = { elements, events, parent, messages, storageRequests, contextRequests, storage,
+  const app = { elements, events, parent, messages, storageRequests, contextRequests,
+    preferenceRequests, recoveryRequests, storage,
     penpot, document, historyEvents };
   if (data !== undefined) await importFile(app, JSON.stringify(data));
   return app;
@@ -138,7 +151,8 @@ test('loaded dictionary enables selection and sends selected scope and language'
   select.listeners.change();
   assert.equal(app.messages.length, 1);
   assert.deepEqual(app.messages[0], {
-    type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page', translations: dictionary
+    type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page',
+    updateRtlLayout: false, mirrorRtlLayout: false, translations: dictionary
   });
 });
 
@@ -167,12 +181,27 @@ test('status ignores foreign windows and displays parent warnings as text', asyn
   const initial = status.textContent;
   const result = { type: 'localization-result', requestId: replies[0].requestId, ok: true, language: 'ES',
     changed: 1, pageCount: 1, alreadyCorrect: 0, tagged: 2,
-    missing: ['<img src=x onerror=alert(1)>'], skipped: 0, failed: 0, failedPages: 0,
-    conflicts: 0, historyFailed: false, restoreAvailable: true };
+    missing: ['<img src=x onerror=alert(1)>'], skipped: 0, failed: 2, failedPages: 0,
+    conflicts: 0, styled: 0, mirrored: 0, layoutSkipped: 3, layoutUnsupported: 2,
+    layoutSubtreesSkipped: 1, styleConflicts: 0, styleMetadataConflicts: 0,
+    layoutConflicts: 2, layoutMetadataConflicts: 1, styleFailed: 0, layoutFailed: 2,
+    layoutFailureReasons: { alignment: 0, constraints: 1, flexDirection: 0, margins: 0,
+      metadata: 0, padding: 0, position: 1, target: 0 },
+    rtl: false, layoutMirrored: false, layoutStateComplete: true,
+    historyFailed: false, restoreAvailable: true };
   app.events.message({ source: {}, data: result });
   assert.equal(status.textContent, initial);
   app.events.message({ source: app.parent, data: result });
   assert.match(status.textContent, /Missing translation keys: <img/);
+  assert.match(status.textContent, /1 component\/grid layout subtree/);
+  assert.match(status.textContent, /2 unsupported layout target/);
+  assert.match(status.textContent, /2 layout property update\(s\) failed: constraints: 1; position: 1/);
+  assert.match(status.textContent, /1 unreadable RTL layout metadata record/);
+  assert.match(status.textContent, /1 externally changed layout shape/);
+  assert.doesNotMatch(status.textContent, /2 layer\(s\) could not be updated/);
+  assert.equal(status.classList.contains('warning'), true);
+  assert.equal(status.classList.contains('error'), false);
+  assert.equal(app.elements.get('apply').textContent, 'Apply to current page');
   app.elements.get('language').value = 'EN';
   app.elements.get('language').listeners.change();
   app.events.message({ source: app.parent, data: { type: 'localization-result', requestId: replies[1].requestId, ok: false, error: 'Failed' } });
@@ -829,7 +858,7 @@ test('restore returns plugin-written text to its session baseline and updates it
   const app = await ui({ EN: { title: 'Hello' } }, { currentPage });
   const restore = app.elements.get('restore');
   assert.equal(restore.disabled, true);
-  assert.match(html, /Closing the plugin clears this recovery journal/);
+  assert.match(html, /Closing the plugin clears only text recovery/);
 
   app.elements.get('language').value = 'EN';
   app.elements.get('language').listeners.change();
@@ -911,6 +940,61 @@ test('restore follows page and file scope while a reopened plugin has no recover
     storage: app.storage, currentPage, pages: [currentPage, otherPage]
   });
   assert.equal(reopened.elements.get('restore').disabled, true);
+});
+
+test('scope changes supersede pending recovery-status checks', async () => {
+  const replies = [];
+  const app = await ui(undefined, { holdRecoveryReplies: replies });
+  assert.equal(app.recoveryRequests.length, 1);
+  const firstRequestId = app.recoveryRequests[0].requestId;
+
+  app.elements.get('scope').value = 'file';
+  app.elements.get('scope').listeners.change();
+  assert.equal(app.recoveryRequests.length, 2);
+  const secondRequestId = app.recoveryRequests[1].requestId;
+  assert.ok(secondRequestId > firstRequestId);
+
+  app.events.message({ source: app.parent,
+    data: { ...replies[0], requestId: firstRequestId, restoreAvailable: false } });
+  assert.equal(app.elements.get('restore').disabled, true, 'the stale page reply is ignored');
+  app.events.message({ source: app.parent,
+    data: { ...replies[1], requestId: secondRequestId, restoreAvailable: true } });
+  assert.equal(app.elements.get('restore').disabled, false,
+    'the current file-scope reply controls availability');
+});
+
+test('restore reports page traversal and unreadable metadata without hiding text recovery', async () => {
+  const pluginData = new Map([['localization.rtl.v1', '{invalid']]);
+  const layer = { id: 'restore-warning-layer', name: 'i18n.title', characters: 'Original',
+    direction: 'ltr', align: 'left',
+    getPluginData: key => pluginData.get(key) || '', setPluginData() {} };
+  let failUnfilteredTraversal = false;
+  const currentPage = { findShapes(criteria) {
+    if (!criteria && failUnfilteredTraversal) throw new Error('Page unavailable');
+    return [layer];
+  } };
+  const app = await ui({ EN: { title: 'Hello' } }, { currentPage });
+  app.elements.get('language').value = 'EN';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(layer.characters, 'Hello');
+
+  failUnfilteredTraversal = true;
+  app.elements.get('restore').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(layer.characters, 'Original');
+  assert.match(app.elements.get('status').textContent, /1 page\(s\) could not be inspected/);
+  assert.equal(app.elements.get('status').classList.contains('error'), true);
+
+  failUnfilteredTraversal = false;
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  app.elements.get('restore').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(app.elements.get('status').textContent,
+    /1 unreadable RTL recovery metadata record/);
+  assert.equal(app.elements.get('status').classList.contains('warning'), true);
+  assert.equal(app.elements.get('status').classList.contains('error'), false);
 });
 
 test('restore locks controls and ignores malformed, stale and foreign replies', async () => {
@@ -1245,4 +1329,215 @@ test('Choose a language is a disabled placeholder after imports and reset', asyn
   assert.equal(select.children[0].disabled, true);
   assert.equal(select.disabled, true);
   assert.equal(app.messages.length, 1);
+});
+
+test('automatic language application preserves the manual checkbox choice', async () => {
+  const storage = new Map([['localization.rtl-layout.v1:file-a', 'true']]);
+  const app = await ui({ ar: { title: 'مرحبا' }, EN: { title: 'Hello' } }, { storage });
+  const checkbox = app.elements.get('mirror-rtl-layout');
+  assert.equal(checkbox.checked, false, 'legacy saved preferences are ignored');
+  assert.equal(app.messages.length, 0);
+  assert.equal(app.preferenceRequests.length, 0);
+
+  checkbox.checked = true;
+  checkbox.listeners.change();
+  app.elements.get('language').value = 'ar';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.messages[0].updateRtlLayout, false);
+  assert.equal(app.messages[0].mirrorRtlLayout, true);
+  assert.equal(checkbox.checked, true, 'language change preserves the pending manual choice');
+
+  await importFile(app, '{"ar":{"title":"مرحبا ثانية"},"EN":{"title":"Hello"}}');
+  assert.equal(app.messages[1].updateRtlLayout, false);
+  assert.equal(app.messages[1].mirrorRtlLayout, true);
+  assert.equal(checkbox.checked, true, 'automatic reimport also preserves the choice');
+
+  checkbox.checked = true;
+  checkbox.listeners.change();
+  app.elements.get('apply').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.messages[2].updateRtlLayout, true);
+  assert.equal(app.messages[2].mirrorRtlLayout, true,
+    'the manual request captures the checked request');
+  assert.equal(checkbox.checked, false, 'the result still reports no mirrored layout');
+  assert.equal(app.preferenceRequests.length, 0);
+  assert.equal(storage.get('localization.rtl-layout.v1:file-a'), 'true',
+    'legacy data is neither restored nor rewritten');
+
+  const reopened = await ui(undefined, { storage });
+  assert.equal(reopened.elements.get('mirror-rtl-layout').checked, false);
+
+  const failed = await ui({ ar: { title: 'مرحبا' } }, { failApplySend: true });
+  const failedCheckbox = failed.elements.get('mirror-rtl-layout');
+  assert.equal(failedCheckbox.checked, false);
+  failed.elements.get('language').value = 'ar';
+  failed.elements.get('language').listeners.change();
+  assert.equal(failedCheckbox.checked, false,
+    'a failed automatic apply does not claim that mirroring was applied');
+});
+
+test('only manual Apply changes managed layout while language changes preserve it', async () => {
+  const rootShape = { id: 'root' };
+  const pluginData = new Map();
+  const child = { id: 'automatic-layout-child', x: 20, width: 30,
+    constraintsHorizontal: 'left', children: [], isComponentInstance: () => false,
+    getPluginData: key => pluginData.get(key) || '',
+    setPluginData: (key, value) => pluginData.set(key, value) };
+  const board = { id: 'automatic-layout-board', x: 0, width: 200, parent: rootShape,
+    children: [child], isComponentInstance: () => false,
+    getPluginData: () => '', setPluginData() {} };
+  child.parent = board;
+  const currentPage = { root: rootShape, findShapes(criteria) {
+    if (!criteria) return [board, child];
+    if (criteria.type === 'text') return [];
+    if (criteria.type === 'board') return [board];
+    return [];
+  }, getShapeById(id) { return [board, child].find(shape => shape.id === id) || null; } };
+  const app = await ui({ ar: {}, EN: {} }, { currentPage });
+  const checkbox = app.elements.get('mirror-rtl-layout');
+
+  app.elements.get('language').value = 'ar';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.messages[0].updateRtlLayout, false);
+  assert.equal(child.x, 20);
+  assert.equal(child.constraintsHorizontal, 'left');
+  assert.equal(checkbox.checked, false);
+
+  checkbox.checked = true;
+  checkbox.listeners.change();
+  app.elements.get('apply').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.messages[1].updateRtlLayout, true);
+  assert.equal(child.x, 150);
+  assert.equal(child.constraintsHorizontal, 'right');
+  assert.equal(checkbox.checked, true);
+
+  const mirroredReopen = await ui(undefined, { currentPage });
+  assert.equal(mirroredReopen.elements.get('mirror-rtl-layout').checked, true,
+    'startup recovery status reflects durable mirrored layout');
+
+  app.elements.get('language').value = 'EN';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.messages[2].updateRtlLayout, false);
+  assert.equal(child.x, 150);
+  assert.equal(child.constraintsHorizontal, 'right');
+  assert.equal(checkbox.checked, true, 'LTR text application preserves mirrored layout');
+
+  app.elements.get('language').value = 'ar';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.messages[3].updateRtlLayout, false);
+  assert.equal(child.x, 150);
+  assert.equal(child.constraintsHorizontal, 'right');
+  assert.equal(checkbox.checked, true);
+
+  checkbox.checked = false;
+  checkbox.listeners.change();
+  app.elements.get('apply').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.messages[4].updateRtlLayout, true);
+  assert.equal(child.x, 20);
+  assert.equal(child.constraintsHorizontal, 'left');
+  assert.equal(checkbox.checked, false);
+
+  const baselineReopen = await ui(undefined, { currentPage });
+  assert.equal(baselineReopen.elements.get('mirror-rtl-layout').checked, false,
+    'startup recovery status reflects the restored baseline');
+});
+
+test('English manual Apply keeps an unchecked target after a pending baseline confirmation', async () => {
+  const rootShape = { id: 'root' };
+  const pluginData = new Map();
+  let metadataWrites = 0;
+  const child = { id: 'english-layout-child', x: 20, width: 30,
+    constraintsHorizontal: 'left', children: [], isComponentInstance: () => false,
+    getPluginData: key => pluginData.get(key) || '',
+    setPluginData(key, value) {
+      metadataWrites++;
+      if (metadataWrites === 4) throw new Error('SANITIZED final metadata failure');
+      pluginData.set(key, value);
+    } };
+  const board = { id: 'english-layout-board', x: 0, width: 200, parent: rootShape,
+    children: [child], isComponentInstance: () => false,
+    getPluginData: () => '', setPluginData() {} };
+  child.parent = board;
+  const currentPage = { root: rootShape, findShapes(criteria) {
+    if (!criteria) return [board, child];
+    if (criteria.type === 'text') return [];
+    if (criteria.type === 'board') return [board];
+    return [];
+  }, getShapeById(id) { return [board, child].find(shape => shape.id === id) || null; } };
+  const app = await ui({ EN: {} }, { currentPage });
+
+  app.elements.get('language').value = 'EN';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  app.elements.get('mirror-rtl-layout').checked = true;
+  app.elements.get('mirror-rtl-layout').listeners.change();
+  app.elements.get('apply').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(app.messages[1].language, 'EN');
+  assert.equal(app.messages[1].updateRtlLayout, true);
+  assert.equal(app.messages[1].mirrorRtlLayout, true);
+  assert.equal(child.x, 150);
+  assert.equal(child.constraintsHorizontal, 'right');
+  assert.equal(app.elements.get('mirror-rtl-layout').checked, true);
+
+  app.elements.get('mirror-rtl-layout').checked = false;
+  app.elements.get('mirror-rtl-layout').listeners.change();
+  app.elements.get('apply').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(app.messages[2].language, 'EN');
+  assert.equal(app.messages[2].updateRtlLayout, true);
+  assert.equal(app.messages[2].mirrorRtlLayout, false);
+  assert.equal(child.x, 20);
+  assert.equal(child.constraintsHorizontal, 'left');
+  assert.equal(app.elements.get('mirror-rtl-layout').checked, false);
+  assert.match(app.elements.get('status').textContent, /recovery metadata: 1/);
+});
+
+test('Arabic application updates text direction and reports RTL styling without changing JSON', async () => {
+  const pluginData = new Map();
+  const layer = { id: 'rtl-layer', name: 'i18n.title', characters: 'Original',
+    direction: 'ltr', align: 'left',
+    getPluginData: key => pluginData.get(key) || '',
+    setPluginData: (key, value) => pluginData.set(key, value) };
+  const app = await ui({ ar: { title: 'مرحبا' } }, {
+    currentPage: { findShapes: () => [layer] }
+  });
+  app.elements.get('language').value = 'ar';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(layer.characters, 'مرحبا');
+  assert.equal(layer.direction, 'rtl');
+  assert.equal(layer.align, 'right');
+  assert.match(app.elements.get('status').textContent, /RTL direction or alignment updated/);
+  assert.deepEqual(app.messages[0].translations, { ar: { title: 'مرحبا' } });
+});
+
+test('durable RTL style recovery is available after reopening while text stays session-only', async () => {
+  const pluginData = new Map();
+  const layer = { id: 'rtl-reopen-layer', name: 'i18n.title', characters: 'Original',
+    direction: 'ltr', align: 'left',
+    getPluginData: key => pluginData.get(key) || '',
+    setPluginData: (key, value) => pluginData.set(key, value) };
+  const currentPage = { findShapes: () => [layer] };
+  const first = await ui({ ar: { title: 'مرحبا' } }, { currentPage });
+  first.elements.get('language').value = 'ar';
+  first.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+
+  const reopened = await ui(undefined, { currentPage });
+  assert.equal(reopened.elements.get('restore').disabled, false);
+  reopened.elements.get('restore').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(layer.characters, 'مرحبا');
+  assert.equal(layer.direction, 'ltr');
+  assert.equal(layer.align, 'left');
+  assert.match(reopened.elements.get('status').textContent, /Restored RTL styling/);
 });
