@@ -36,13 +36,15 @@ def request(path, method="GET"):
 
 class ServerTests(unittest.TestCase):
     def test_runtime_assets_and_query_strings(self):
-        for asset in ("manifest.json", "plugin.js", "index.html?v=123"):
+        for asset in ("manifest.json", "plugin.js", "index.html?v=123", "ui.js"):
             with self.subTest(asset=asset):
                 headers, body = request("/" + asset)
                 self.assertIn(b"200 OK", headers)
                 self.assertIn(b"Access-Control-Allow-Origin: *", headers)
                 self.assertIn(b"Cache-Control: no-store", headers)
                 self.assertTrue(body)
+                if asset == "ui.js":
+                    self.assertEqual(body, (Path(__file__).resolve().parents[1] / asset).read_bytes())
 
     def test_private_paths_and_directory_listing_are_denied(self):
         for path in ("/", "/.git/config", "/.env", "/README.md", "/server.py",

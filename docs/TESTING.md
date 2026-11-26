@@ -14,7 +14,7 @@ Run the Node suite for plugin/UI/message changes, the Python suite for server ch
 | Suite | Boundary and coverage |
 | --- | --- |
 | [Plugin](../tests/plugin.test.cjs) | Shipped script with mocked Penpot proxies/storage/history/plugin data: manifest/UI wiring, full request validation, context snapshots and stale-page rejection, matching, scope, plan-before-write ordering, repeated keys, idempotence, mixed-style skips, RTL language/script detection, smart alignment, layout reflection/reversal, grid/component skips, metadata failure/conflicts, traversal/setter/history failures, grouped apply/restore, readback, reopening recovery, sanitized logs, request IDs, saved-record limits, per-file storage isolation, and file-switch rejection. |
-| [UI](../tests/ui.test.cjs) | Shipped inline script and adapter together with DOM/Penpot/storage/history/plugin-data stubs and real Blob byte reads: startup/reopening, pre-read context capture, page/file navigation races, local imports, dynamic languages, invalid/canceled retention, limits/BOM/Unicode, malformed UTF-8 rejection, automatic/manual apply, direction switching, page direction persistence and reporting, durable style recovery, session text recovery, operation locks, source/text rendering, per-file save/forget, transport/storage failures, result validation, and stale/foreign/malformed replies. |
+| [UI](../tests/ui.test.cjs) | Shipped UI script referenced by the HTML and the adapter, with DOM/Penpot/storage/history/plugin-data stubs and real Blob byte reads. Covers script URL resolution at the root and under a static subpath, startup/reopening, pre-read context capture, page/file navigation races, local imports, dynamic languages, invalid/canceled retention, limits/BOM/Unicode, malformed UTF-8 rejection, automatic/manual apply, direction switching, page direction persistence and reporting, durable style recovery, session text recovery, operation locks, source/text rendering, per-file save/forget, transport/storage failures, result validation, and stale/foreign/malformed replies. |
 | [Server](../tests/test_server.py) | Actual handler with in-memory HTTP connections: allowed assets, private/traversal/symlink rejection, query strings, HEAD, preflight, and headers. |
 
 GitHub Actions runs both commands on `ubuntu-latest` with Node.js 22 and Python 3.14, without installing project dependencies. The [test workflow](../.github/workflows/tests.yml) runs when a pull request is opened or receives new commits, and on pushes to `main`, including pull request merges. The local development server supports Python 3.9 and later. These tests do not establish browser policy, Penpot layout/style/font behavior, or undo/restore correctness.
@@ -47,6 +47,12 @@ These checks can help investigate a reported problem or document compatibility w
 Record each run's date, revision, `penpot.version`, browser/OS versions, sanitized fixture, observations, and unresolved issues. Keep private design text and dictionaries out of fixtures and screenshots.
 
 ## Validation record
+
+### External UI script — 2026-11-26
+
+Moved the UI script into `ui.js`. Compared it with the former inline script after normalizing indentation and verified that the HTML and CSS match apart from the script reference.
+
+`node --check ui.js`, `node --test tests/*.test.cjs` (116 tests), the Python unittest suite (four in-memory HTTP tests), and `git diff --check` passed. The UI tests execute the script referenced by the HTML and verify its URL under both root and repository-style paths. The HTTP suite checks that the server returns the shipped script contents. Live browser and Penpot loading, deployed HTTPS hosting, and remote CI were not exercised.
 
 ### Single direction switch control — 2026-11-26
 

@@ -6,7 +6,7 @@ from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parent
-ASSETS = {"manifest.json", "plugin.js", "index.html"}
+ASSETS = {"manifest.json", "plugin.js", "index.html", "ui.js"}
 
 
 class PluginHandler(SimpleHTTPRequestHandler):

@@ -13,7 +13,7 @@ You need a local copy of this repository, Python 3.9+, and a browser with access
 3. Open a disposable Penpot design, then open Plugin Manager from its toolbar or menu.
 4. Install using `http://localhost:4400/manifest.json` and launch **Penpot Localization**.
 
-Keep the terminal running while using the plugin; stop the server with **Ctrl+C** when finished. The server binds to loopback and serves only `manifest.json`, `plugin.js`, and `index.html`. Translation files are read by the browser's file picker, never served by this development server.
+Keep the terminal running while using the plugin. Stop the server with **Ctrl+C** when finished. The server binds to loopback and serves only `manifest.json`, `plugin.js`, `index.html`, and `ui.js`. The browser reads translations through the file picker.
 
 For an existing installation, reinstall from the same manifest to pick up the added `allow:localstorage` permission before testing saved imports.
 
@@ -100,4 +100,4 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md). [Project context](docs/PROJECT_CO
 
 MIT is recommended, but the owner must choose a license and copyright attribution before a root `LICENSE` is applied. No license has been applied yet, so this is not an open-source release. Review terms for reused code and assets. See the [MIT license text](https://opensource.org/license/mit); [MPL-2.0](https://www.mozilla.org/en-US/MPL/2.0/) is an alternative if the owner prefers changes to the plugin's source files to remain open, subject to its obligations.
 
-Public GitHub hosting and Plugin Hub submission are planned after the release package and license decision are complete. Publishing, pushing, deploying, and submitting require explicit owner approval; selecting a license does not authorize those actions.
+Public GitHub hosting and Plugin Hub submission are planned after the release package and license decision are complete. Keep `manifest.json`, `plugin.js`, `index.html`, and `ui.js` in the same directory on the static host so relative URLs also work under a subpath. Publishing, pushing, deploying, and submitting require explicit owner approval; selecting a license does not authorize those actions.
