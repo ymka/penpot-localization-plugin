@@ -9,6 +9,10 @@ Read [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md) before changing code. It
 - For mutation or restore work, follow [the planned design](docs/PROJECT_CONTEXT.md#planned-mutation-and-recovery-design). For release work, use [docs/V0_1_0_PLAN.md](docs/V0_1_0_PLAN.md).
 - Before validation, read [docs/TESTING.md](docs/TESTING.md) for commands, test boundaries, and optional Penpot compatibility checks relevant to the change.
 
+## Branch naming
+
+Name new branches `feat/<name>` for features, `fix/<name>` for bug fixes, and `chore/<name>` for maintenance. Use a short, descriptive, lowercase name with hyphens between words, such as `feat/language-picker`.
+
 ## Implementation standards
 
 - Keep the plain JavaScript/HTML plugin usable without a build step. Python is a local development server, not a plugin backend. Add dependencies or new infrastructure only for a demonstrated need and document the reason.
