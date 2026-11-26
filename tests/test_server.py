@@ -36,19 +36,19 @@ def request(path, method="GET"):
 
 class ServerTests(unittest.TestCase):
     def test_runtime_assets_and_query_strings(self):
-        for asset in ("manifest.json", "plugin.js", "index.html?v=123", "ui.js"):
+        plugin_directory = Path(__file__).resolve().parents[1] / "plugin"
+        for asset in ("manifest.json", "plugin.js", "index.html", "ui.js"):
             with self.subTest(asset=asset):
-                headers, body = request("/" + asset)
+                headers, body = request(f"/{asset}?v=123")
                 self.assertIn(b"200 OK", headers)
                 self.assertIn(b"Access-Control-Allow-Origin: *", headers)
                 self.assertIn(b"Cache-Control: no-store", headers)
-                self.assertTrue(body)
-                if asset == "ui.js":
-                    self.assertEqual(body, (Path(__file__).resolve().parents[1] / asset).read_bytes())
+                self.assertEqual(body, (plugin_directory / asset).read_bytes())
 
     def test_private_paths_and_directory_listing_are_denied(self):
-        for path in ("/", "/.git/config", "/.env", "/README.md", "/server.py",
-                     "/translations.local.json", "/translations.json", "/translations.json?v=123", "/../manifest.json",
+        for path in ("/", "/plugin/", "/plugin/manifest.json", "/.git/config",
+                     "/.env", "/README.md", "/server.py", "/translations.local.json",
+                     "/translations.json", "/translations.json?v=123", "/../manifest.json",
                      "/%2e%2e/manifest.json", "/%2egit/config"):
             with self.subTest(path=path):
                 headers, _ = request(path)

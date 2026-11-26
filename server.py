@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent / "plugin"
 ASSETS = {"manifest.json", "plugin.js", "index.html", "ui.js"}
 
 
