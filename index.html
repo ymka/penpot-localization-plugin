@@ -21,8 +21,6 @@
     button { margin-top: 10px; cursor: pointer; }
     #apply { background: light-dark(#315bce, #9ab7ff); border-color: light-dark(#315bce, #9ab7ff); color: light-dark(#fff, #111a2e); font-weight: 600; }
     #restore { font-weight: 600; }
-    .direction-actions { display: flex; gap: 8px; }
-    .direction-actions button { flex: 1; min-width: 0; }
     #direction-status { margin-bottom: 0; }
     :focus-visible { outline: 2px solid light-dark(#315bce, #9ab7ff); outline-offset: 2px; }
     select:disabled, input:disabled, button:disabled { opacity: 0.55; cursor: default; }
@@ -64,10 +62,15 @@
   <small id="language-help">Changing language applies immediately. Reopening only restores your choices. Use the button to apply again, including to newly added text.</small>
   <button id="apply" type="button" disabled>Apply to current page</button>
   <small id="direction-status" role="status" aria-live="polite">Checking direction…</small>
-  <div class="direction-actions" role="group" aria-label="Text and layout direction">
-    <button id="switch-rtl" type="button" aria-describedby="direction-status" hidden disabled>Switch to RTL</button>
-    <button id="switch-ltr" type="button" aria-describedby="direction-status" hidden disabled>Switch to LTR</button>
+  <div id="direction-choice" hidden>
+    <label for="target-direction">Target direction</label>
+    <select id="target-direction" aria-describedby="direction-status" disabled>
+      <option value="" disabled selected>Choose a direction</option>
+      <option value="ltr">Left to right (LTR)</option>
+      <option value="rtl">Right to left (RTL)</option>
+    </select>
   </div>
+  <button id="switch-direction" type="button" aria-describedby="direction-status" hidden disabled>Switch direction</button>
   <button id="restore" type="button" aria-describedby="recovery-help" disabled>Restore current page</button>
   <small id="recovery-help">Restore returns session text and durable RTL style/layout changes to their baselines. External edits and missing layers are reported and left unchanged. Closing the plugin clears only text recovery.</small>
 
@@ -86,10 +89,9 @@
     const restoreButton = document.getElementById("restore");
     const forgetButton = document.getElementById("forget");
     const directionStatus = document.getElementById("direction-status");
-    const directionButtons = {
-      rtl: document.getElementById("switch-rtl"),
-      ltr: document.getElementById("switch-ltr")
-    };
+    const directionChoice = document.getElementById("direction-choice");
+    const directionSelect = document.getElementById("target-direction");
+    const directionButton = document.getElementById("switch-direction");
     const MAX_BYTES = 1024 * 1024;
     const languageNames = {
       AF: "Afrikaans",
@@ -164,7 +166,7 @@
     let pendingRecovery = null;
     let restoreAvailable = false;
     let directionContext = null;
-    let restoreDirectionFocus = null;
+    let restoreDirectionFocus = false;
     let failedApply = null;
     let restoreApplyFocus = false;
     let restoreRestoreFocus = false;
@@ -240,6 +242,13 @@
       updateControls();
     }
 
+    function reverseDirection() {
+      if (!directionContext || directionContext.incomplete) return "";
+      if (directionContext.direction === "ltr") return "rtl";
+      if (directionContext.direction === "rtl") return "ltr";
+      return "";
+    }
+
     function updateControls() {
       const busy = loading || pendingContext !== null
         || pendingApply !== null || pendingRestore !== null;
@@ -250,22 +259,24 @@
       languageSelect.disabled = busy || !translations;
       scopeSelect.disabled = busy;
       const currentDirection = directionContext?.direction;
+      const reverse = reverseDirection();
+      const target = reverse || directionSelect.value;
       directionStatus.textContent = pendingRecovery ? "Checking direction…"
+        : directionContext?.incomplete ? "Conversion incomplete. Choose a direction to retry or reverse."
         : currentDirection === "ltr" || currentDirection === "rtl"
           ? `Direction: ${currentDirection.toUpperCase()}`
-          : currentDirection === "mixed" ? "Mixed direction. Choose a direction for text and layout."
-          : currentDirection === "unknown" ? "Unknown direction. Choose a direction for text and layout."
+          : currentDirection === "mixed" ? "Mixed direction."
+          : currentDirection === "unknown" ? "Unknown direction."
           : "Direction is unavailable.";
-      for (const [direction, button] of Object.entries(directionButtons)) {
-        button.hidden = !directionContext || currentDirection === direction;
-        button.disabled = busy || Boolean(pendingRecovery) || button.hidden;
-      }
+      directionChoice.hidden = !directionContext || Boolean(reverse);
+      directionSelect.disabled = busy || Boolean(pendingRecovery) || directionChoice.hidden;
+      directionButton.hidden = !directionContext;
+      directionButton.disabled = busy || Boolean(pendingRecovery) || directionButton.hidden || !target;
+      directionButton.textContent = target ? `Switch to ${target.toUpperCase()}` : "Switch direction";
       if (!busy && !pendingRecovery && restoreDirectionFocus) {
-        const button = directionButtons[restoreDirectionFocus];
-        const nextButton = button.hidden
-          ? Object.values(directionButtons).find(candidate => !candidate.hidden) : button;
-        if (nextButton) nextButton.focus();
-        restoreDirectionFocus = null;
+        if (!directionButton.disabled) directionButton.focus();
+        else if (!directionSelect.disabled) directionSelect.focus();
+        restoreDirectionFocus = false;
       }
       applyButton.disabled = busy || !hasSelection;
       applyButton.textContent = pendingApply && !pendingApply.direction ? "Applying…" : needsRetry ? "Try again"
@@ -445,6 +456,8 @@
         }, "*");
       } catch (error) {
         pendingRecovery = null;
+        directionContext = null;
+        directionSelect.value = "";
         updateControls();
       }
     }
@@ -455,13 +468,20 @@
       pendingRecovery = null;
       if (request.scope === scopeSelect.value && result.ok === true
           && typeof result.restoreAvailable === "boolean"
+          && typeof result.layoutStateComplete === "boolean"
           && ["ltr", "rtl", "mixed", "unknown"].includes(result.direction)
           && typeof result.pageId === "string"
           && result.pageId.length > 0 && result.pageId.length <= 200) {
         restoreAvailable = result.restoreAvailable;
-        directionContext = { direction: result.direction, pageId: result.pageId };
+        if (request.scope === "page" && directionContext?.pageId !== result.pageId) {
+          directionSelect.value = "";
+        }
+        directionContext = { direction: result.direction, pageId: result.pageId,
+          incomplete: !result.layoutStateComplete };
+        if (reverseDirection()) directionSelect.value = "";
       } else {
         directionContext = null;
+        directionSelect.value = "";
       }
       updateControls();
     }
@@ -510,10 +530,12 @@
         translations, ...(pageId ? { pageId } : {}) });
     }
 
-    function switchDirection(direction) {
-      const button = directionButtons[direction];
-      if (button.disabled || !directionContext) return;
-      if (document.activeElement === button) restoreDirectionFocus = direction;
+    function switchDirection() {
+      if (directionButton.disabled || !directionContext) return;
+      const direction = reverseDirection() || directionSelect.value;
+      if (direction !== "ltr" && direction !== "rtl") return;
+      restoreDirectionFocus = document.activeElement === directionButton;
+      directionSelect.value = direction;
       sendApply({ type: "switch-direction", direction,
         ...(scopeSelect.value === "page" ? { pageId: directionContext.pageId } : {}) });
     }
@@ -565,6 +587,7 @@
           result.layoutConflicts,
           result.layoutMetadataConflicts,
           result.styleFailed,
+          result.styleUnsupported,
           result.layoutFailed
         ];
         if ((direction ? result.direction !== direction : result.language !== pendingApply.language)
@@ -595,6 +618,7 @@
           ? `${result.skipped} layer(s) with mixed direction or alignment were skipped.`
           : `${result.skipped} mixed-style layer(s) skipped to preserve formatting.`);
         if (!direction && result.styled) parts.push(`${result.styled} text layer(s) had RTL direction or alignment updated.`);
+        if (result.styleUnsupported) parts.push(`${result.styleUnsupported} text layer(s) kept their unset direction so their original style can be preserved.`);
         if (result.layoutSubtreesSkipped) parts.push(`${result.layoutSubtreesSkipped} component/grid layout subtree(s) were left unchanged.`);
         if (result.layoutUnsupported) parts.push(`${result.layoutUnsupported} unsupported layout target(s) were left unchanged.`);
         if (result.styleMetadataConflicts) parts.push(`${result.styleMetadataConflicts} unreadable RTL text-style metadata record(s) were left unchanged.`);
@@ -607,14 +631,14 @@
         if (result.layoutFailed) parts.push(`${result.layoutFailed} layout property update(s) failed: ${formatLayoutFailureReasons(result.layoutFailureReasons)}.`);
         const otherFailed = result.failed - result.styleFailed - result.layoutFailed;
         if (otherFailed) parts.push(`${otherFailed} other layer or operation update(s) failed.`);
-        if (result.failedPages) parts.push(`${result.failedPages} page(s) could not be inspected.`);
+        if (result.failedPages) parts.push(`${result.failedPages} page(s) could not be processed.`);
         if (result.conflicts) parts.push(`${result.conflicts} layer(s) changed while the operation was being prepared and were left unchanged.`);
         if (result.historyFailed) parts.push("Penpot could not finish the grouped history block. Inspect undo history before continuing.");
         const blockingFailure = otherFailed > 0 || result.failedPages > 0
           || result.conflicts > 0 || result.historyFailed;
         const warning = result.skipped > 0 || result.layoutSkipped > 0
           || result.missing.length > 0 || result.styleConflicts > 0
-          || result.layoutConflicts > 0 || result.styleFailed > 0
+          || result.layoutConflicts > 0 || result.styleFailed > 0 || result.styleUnsupported > 0
           || result.layoutFailed > 0;
         if (!direction) failedApply = blockingFailure ? pendingApply : null;
         setStatus(parts.join("\n"), blockingFailure ? "error" : warning ? "warning" : "normal");
@@ -688,7 +712,7 @@
         ];
         if (result.stylesRestored) parts.push(`Restored RTL styling on ${result.stylesRestored} text layer(s).`);
         if (result.layoutsRestored) parts.push(`Restored ${result.layoutsRestored} mirrored layout shape(s).`);
-        if (result.failedPages) parts.push(`${result.failedPages} page(s) could not be inspected.`);
+        if (result.failedPages) parts.push(`${result.failedPages} page(s) could not be processed.`);
         if (result.layoutSubtreesSkipped) parts.push(`${result.layoutSubtreesSkipped} component/grid layout subtree(s) were left unchanged.`);
         if (result.layoutUnsupported) parts.push(`${result.layoutUnsupported} unsupported layout target(s) were left unchanged.`);
         if (result.styleMetadataConflicts) parts.push(`${result.styleMetadataConflicts} unreadable RTL text-style metadata record(s) were left unchanged.`);
@@ -740,9 +764,8 @@
       restoreRestoreFocus = document.activeElement === restoreButton;
       restoreLocalization();
     });
-    for (const [direction, button] of Object.entries(directionButtons)) {
-      button.addEventListener("click", () => switchDirection(direction));
-    }
+    directionSelect.addEventListener("change", updateControls);
+    directionButton.addEventListener("click", switchDirection);
     forgetButton.addEventListener("click", () => {
       if (loading || pendingApply || pendingRestore || !fileId) return;
       setLoading(true);
@@ -751,6 +774,7 @@
     scopeSelect.addEventListener("change", () => {
       if (loading || pendingApply || pendingRestore) return;
       directionContext = null;
+      directionSelect.value = "";
       requestRecoveryStatus();
       if (!translations) return;
       if (!languageSelect.value) setStatus("Scope changed. Select a language to update the design.");
@@ -784,7 +808,6 @@
         return;
       }
       if (result?.type === "design-context-changed") {
-        directionContext = null;
         requestRecoveryStatus();
       } else if (result?.type === "localization-result" || result?.type === "direction-result") {
         receiveLocalizationResult(result);

@@ -38,7 +38,7 @@ These checks can help investigate a reported problem or document compatibility w
 | Grow settings/long strings | Fixed/auto-width/auto-height retained; inspect clipping, wrapping, and parent reflow | Pending |
 | CJK/missing fonts | Inspect glyph coverage and fallback; warnings match limitations | Pending |
 | Locked layers/components | No unexpected component changes; failed/skipped counts accurate | Pending |
-| Undo/redo | Apply and restore undo/redo coherently across pages | Pending: grouped implementation and mocked close-on-failure coverage added; real history unverified |
+| Undo/redo | Apply and Restore create one undo/redo step per edited page and return to the starting page in file scope | Pending: grouped implementation and mocked close-on-failure coverage added; real history unverified |
 | Restore/conflicts | Handle edits made outside the plugin, layers deleted outside the plugin before Restore, file switches, repeated switches, and external undo safely; Restore must not delete or recreate layers | Pending: session restore/conflict/externally deleted-layer/rebase behavior covered with mocks; real host unverified |
 | Rapid input/messages | Only one UI context/mutation request pending; conflicting controls locked; matching results restore them; foreign/stale replies ignored and malformed matches reported; active-page changes during reads cannot retarget page-scoped automatic apply | Pending: mocked context/apply/restore coverage added; real host unverified |
 | Keyboard/narrow window | Apply/restore controls, status, focus, and warnings remain usable | Pending |
@@ -47,6 +47,16 @@ These checks can help investigate a reported problem or document compatibility w
 Record each run's date, revision, `penpot.version`, browser/OS versions, sanitized fixture, observations, and unresolved issues. Keep private design text and dictionaries out of fixtures and screenshots.
 
 ## Validation record
+
+### Single direction switch control — 2026-11-26
+
+All 115 mocked plugin/UI tests and `git diff --check` passed. The UI tests verify the reverse action for a known direction, an explicit target for mixed or unknown scopes, scope reset, busy controls, retained focus, and a preselected retry after a partial switch. Live browser and Penpot checks were not run.
+
+### PR #4 review fixes — 2026-11-26
+
+The shipped adapter and UI were checked with 115 mocked plugin/UI tests. Added coverage enforces active-page writes, covers failed activation and file navigation races, and verifies one history block per edited page. Recovery cases assert no irreversible writes for unset directions or silently rejected recovery metadata, per-page Restore after a conflict, retry and reversal after partial conversion, nested reflection and group reflow, and continued recovery from historical absolute position records. The UI exercises retry after a partial switch.
+
+`node --check plugin.js`, `node --test tests/*.test.cjs`, `python3 -m unittest discover -s tests -p 'test_*.py' -v` (four in-memory HTTP checks), and `git diff --check` passed. Penpot 2.19.3 source was checked for active-page setters and workspace transactions. Live Penpot navigation, layout, metadata persistence, undo/redo and remote CI were not exercised.
 
 ### LTR/RTL direction switching — 2026-11-26
 

@@ -59,6 +59,7 @@ function runtime(pages = [page()], overrides = {}) {
   const history = [];
   const penpot = {
     currentPage: pages[0], currentFile: { id: 'file-a', pages },
+    async openPage(id) { this.currentPage = this.currentFile.pages.find(page => page.id === id); },
     history: {
       undoBlockBegin() { const id = Symbol('history'); history.push(['begin', id]); return id; },
       undoBlockFinish(id) { history.push(['finish', id]); }
@@ -67,18 +68,22 @@ function runtime(pages = [page()], overrides = {}) {
       sendMessage: msg => messages.push(JSON.parse(JSON.stringify(msg))) },
     ...overrides
   };
-  vm.runInNewContext(code, { penpot, TextEncoder, console: { error: (...args) => errors.push(args) } });
+  vm.runInNewContext(code, { penpot, TextEncoder, setTimeout, clearTimeout,
+    console: { error: (...args) => errors.push(args) } });
+  function request(message) {
+    const index = messages.length;
+    const pending = receive(message);
+    if (messages.length > index || !pending) return messages[index];
+    return pending.then(() => messages[index]);
+  }
   return { opened, messages, errors, history, penpot, send: receive, apply(extra = {}) {
-    receive({ type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page',
+    return request({ type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page',
       translations: { ES: { 'login.title': 'Hola' } }, ...extra });
-    return messages.at(-1);
   }, switchDirection(direction, extra = {}) {
-    receive({ type: 'switch-direction', requestId: 1, fileId: 'file-a', scope: 'page',
+    return request({ type: 'switch-direction', requestId: 1, fileId: 'file-a', scope: 'page',
       pageId: penpot.currentPage.id, direction, ...extra });
-    return messages.at(-1);
   }, restore(extra = {}) {
-    receive({ type: 'restore-localization', requestId: 2, fileId: 'file-a', scope: 'page', ...extra });
-    return messages.at(-1);
+    return request({ type: 'restore-localization', requestId: 2, fileId: 'file-a', scope: 'page', ...extra });
   } };
 }
 
@@ -105,11 +110,11 @@ test('current-page scope changes only tagged keys and updates repeated keys', ()
   assert.equal(result.pageCount, 1);
 });
 
-test('file scope visits every page and repeated application is idempotent', () => {
+test('file scope visits every page and repeated application is idempotent', async () => {
   const a = text('i18n.login.title'), b = text('i18n.login.title');
   const app = runtime([page(a), page(b)]);
-  assert.equal(app.apply({ scope: 'file' }).changed, 2);
-  const second = app.apply({ scope: 'file' });
+  assert.equal((await app.apply({ scope: 'file' })).changed, 2);
+  const second = await app.apply({ scope: 'file' });
   assert.equal(second.changed, 0);
   assert.equal(second.alreadyCorrect, 2);
   assert.equal(second.pageCount, 2);
@@ -597,7 +602,7 @@ test('design context snapshots expose only validated file and page IDs', () => {
   assert.equal(app.messages.at(-1).pageId, undefined);
 });
 
-test('page-scoped apply rejects a stale captured page while file scope remains stable', () => {
+test('page-scoped apply rejects a stale captured page while file scope remains stable', async () => {
   const firstLayer = text('i18n.login.title');
   const secondLayer = text('i18n.login.title');
   const firstPage = page(firstLayer);
@@ -611,7 +616,7 @@ test('page-scoped apply rejects a stale captured page while file scope remains s
   assert.equal(secondLayer.characters, 'Original');
   assert.equal(app.history.length, 0);
 
-  const applied = app.apply({ requestId: 2, scope: 'file', pageId: firstPage.id });
+  const applied = await app.apply({ requestId: 2, scope: 'file', pageId: firstPage.id });
   assert.equal(applied.changed, 2);
   assert.equal(firstLayer.characters, 'Hola');
   assert.equal(secondLayer.characters, 'Hola');
@@ -1034,21 +1039,21 @@ test('direction rejects stale, malformed and cross-file requests without writes'
   assert.deepEqual(app.history, []);
 });
 
-test('rejected page metadata prevents direction setters while other pages can switch', () => {
+test('rejected page metadata prevents direction setters while other pages can switch', async () => {
   const layer = rtlText();
   const sibling = rtlText();
   const broken = withPluginData(page(layer));
   broken.setPluginData = () => { throw new Error('Page metadata rejected'); };
   const safe = page(sibling);
   const app = runtime([broken, safe]);
-  const result = app.switchDirection('rtl', { scope: 'file' });
+  const result = await app.switchDirection('rtl', { scope: 'file' });
   assert.equal(result.failedPages, 1);
   assert.equal(result.styled, 1);
   assert.equal(layer.direction, 'ltr');
   assert.equal(layer.getPluginData('localization.rtl.v1'), '');
   assert.equal(sibling.direction, 'rtl');
   assert.equal(safe.getPluginData('localization.page-direction.v1'), 'rtl');
-  assert.deepEqual(app.history.map(([event]) => event), ['begin', 'finish']);
+  assert.deepEqual(app.history.map(([event]) => event), ['begin', 'finish', 'begin', 'finish']);
 });
 
 test('Restore after reopening returns a native RTL page to baseline and clears its chosen direction', () => {
@@ -1065,4 +1070,235 @@ test('Restore after reopening returns a native RTL page to baseline and clears i
   reopened.send({ type: 'recovery-status-request', requestId: 3, fileId: 'file-a', scope: 'page' });
   assert.equal(reopened.messages.at(-1).direction, 'rtl');
   assert.equal(reopened.messages.at(-1).restoreAvailable, false);
+});
+
+test('an unset direction stays recoverable while the tagged text still translates', () => {
+  const layer = rtlText();
+  layer.direction = null;
+  let directionWrites = 0;
+  Object.defineProperty(layer, 'direction', {
+    get() { return null; },
+    set() { directionWrites++; }
+  });
+  const app = runtime([page(layer)]);
+  const switched = app.switchDirection('rtl');
+  assert.equal(switched.styleUnsupported, 1);
+  assert.equal(switched.styled, 0);
+  app.restore();
+  const applied = app.apply({ language: 'ar', translations: { ar: { 'login.title': 'مرحبا' } } });
+  assert.equal(applied.changed, 1);
+  assert.equal(applied.styleUnsupported, 1);
+  assert.equal(directionWrites, 0);
+  assert.equal(layer.getPluginData('localization.rtl.v1'), '');
+  assert.equal(app.restore().restored, 1);
+  assert.equal(layer.characters, 'Original');
+});
+
+test('silently rejected shape metadata prevents writes or leaves confirmed recovery pending', () => {
+  const initialRejected = rtlText();
+  initialRejected.setPluginData = () => {};
+  const finalRejected = rtlText();
+  const setData = finalRejected.setPluginData;
+  finalRejected.setPluginData = (key, value) => {
+    if (JSON.parse(value).textStyle.active !== 'rtl') setData(key, value);
+  };
+  const current = page(initialRejected, finalRejected);
+  const app = runtime([current]);
+  const result = app.switchDirection('rtl');
+  assert.equal(result.styleFailed, 2);
+  assert.equal(result.styled, 1);
+  assert.equal(result.layoutStateComplete, false);
+  assert.deepEqual([initialRejected.direction, initialRejected.align], ['ltr', 'left']);
+  assert.equal(initialRejected.getPluginData('localization.rtl.v1'), '');
+  assert.deepEqual([finalRejected.direction, finalRejected.align], ['rtl', 'right']);
+  assert.match(finalRejected.getPluginData('localization.rtl.v1'), /pending-rtl/);
+  assert.equal(app.restore().stylesRestored, 1);
+  assert.deepEqual([finalRejected.direction, finalRejected.align], ['ltr', 'left']);
+});
+
+function boardPage(board, ...descendants) {
+  const root = { id: fixtureId('root'), x: 0 };
+  board.parent = root;
+  const shapes = [board, ...descendants];
+  return { root, findShapes(criteria) {
+    if (!criteria) return shapes;
+    return criteria.type === 'board' ? [board] : descendants.filter(shape => shape.name);
+  }, getShapeById(id) { return shapes.find(shape => shape.id === id) || null; } };
+}
+
+test('nested reflection uses parent-relative positions for both direction reversal and Restore', () => {
+  const child = withPluginData({ id: fixtureId('child'), x: 30, width: 10,
+    constraintsHorizontal: 'left' });
+  let innerX = 20;
+  const inner = withPluginData({ id: fixtureId('board'), width: 80, children: [child],
+    constraintsHorizontal: 'left', get x() { return innerX; },
+    set x(value) { child.x += value - innerX; innerX = value; } });
+  const outer = withPluginData({ id: fixtureId('board'), x: 0, width: 200, children: [inner] });
+  inner.parent = outer;
+  child.parent = inner;
+  const current = boardPage(outer, inner, child);
+  const app = runtime([current]);
+  const rtl = app.switchDirection('rtl');
+  assert.equal(rtl.layoutConflicts, 0);
+  assert.deepEqual([outer.x, inner.x, child.x], [0, 100, 160]);
+  assert.equal(app.switchDirection('ltr').layoutConflicts, 0);
+  assert.deepEqual([outer.x, inner.x, child.x], [0, 20, 30]);
+  app.switchDirection('rtl');
+  const reopened = runtime([current]);
+  const restored = reopened.restore();
+  assert.equal(restored.layoutsRestored, 2);
+  assert.equal(restored.layoutConflicts, 0);
+  assert.deepEqual([outer.x, inner.x, child.x], [0, 20, 30]);
+});
+
+test('reversing a partial margin swap recovers asymmetry even when the current values match', () => {
+  let rightMargin = 15;
+  let rejectRight = true;
+  const margins = { absolute: false, marginType: 'multiple', leftMargin: 5,
+    get rightMargin() { return rightMargin; },
+    set rightMargin(value) {
+      if (rejectRight) throw new Error('rejected margin');
+      rightMargin = value;
+    } };
+  const child = withPluginData({ id: fixtureId('child'), layoutChild: margins });
+  const board = withPluginData({ id: fixtureId('board'), x: 0, width: 200,
+    flex: { dir: 'row', leftPadding: 0, rightPadding: 0 }, children: [child] });
+  child.parent = board;
+  const app = runtime([boardPage(board, child)]);
+  assert.equal(app.switchDirection('rtl').layoutFailed, 1);
+  assert.deepEqual([margins.leftMargin, margins.rightMargin], [15, 15]);
+  rejectRight = false;
+  const reversed = app.switchDirection('ltr');
+  assert.equal(reversed.layoutFailed, 0);
+  assert.equal(reversed.layoutConflicts, 0);
+  assert.deepEqual([margins.leftMargin, margins.rightMargin], [5, 15]);
+});
+
+test('retry or reversal of an incomplete page switch preserves the source layout for untouched shapes', () => {
+  for (const direction of ['ltr', 'rtl']) {
+    const child = withPluginData({ id: fixtureId('child'), x: 20, width: 30,
+      constraintsHorizontal: 'left' });
+    const setData = child.setPluginData;
+    child.setPluginData = () => {};
+    const label = rtlText();
+    const board = withPluginData({ id: fixtureId('board'), x: 0, width: 200, children: [child] });
+    child.parent = board;
+    const current = boardPage(board, child, label);
+    const app = runtime([current]);
+    assert.equal(app.switchDirection('rtl').layoutFailed, 1);
+    assert.equal(child.x, 20);
+    assert.equal(current.getPluginData('localization.page-direction.v1'), 'pending:ltr:rtl');
+
+    child.setPluginData = setData;
+    const reopened = runtime([current]);
+    const next = reopened.switchDirection(direction);
+    assert.equal(next.layoutStateComplete, true);
+    assert.equal(child.x, direction === 'rtl' ? 150 : 20);
+    assert.equal(label.direction, direction);
+    assert.equal(current.getPluginData('localization.page-direction.v1'), direction);
+  }
+});
+
+test('file scope activates targets before writing and clears only successfully restored page directions', async () => {
+  const layers = [rtlText(), rtlText(), rtlText()];
+  const pages = layers.map(layer => page(layer));
+  const activeId = () => app.penpot.currentPage?.id;
+  const navigated = [];
+  const app = runtime(pages, { async openPage(id) {
+    navigated.push(id);
+    if (id === pages[2].id) throw new Error('page unavailable');
+    this.currentPage = pages.find(page => page.id === id);
+  } });
+  for (const [index, layer] of layers.entries()) {
+    let direction = layer.direction;
+    Object.defineProperty(layer, 'direction', {
+      get() { return direction; },
+      set(value) {
+        assert.equal(activeId(), pages[index].id);
+        direction = value;
+      }
+    });
+  }
+
+  const switched = await app.switchDirection('rtl', { scope: 'file' });
+  assert.equal(switched.failedPages, 1);
+  assert.equal(switched.styled, 2);
+  assert.deepEqual(layers.map(layer => layer.direction), ['rtl', 'rtl', 'ltr']);
+  assert.deepEqual(pages.map(page => page.getPluginData('localization.page-direction.v1')), ['rtl', 'rtl', '']);
+  assert.deepEqual(navigated, [pages[1].id, pages[2].id, pages[0].id]);
+  assert.equal(activeId(), pages[0].id);
+  assert.deepEqual(app.history.map(([event]) => event), ['begin', 'finish', 'begin', 'finish']);
+
+  layers[0].align = 'center';
+  const restored = await app.restore({ scope: 'file' });
+  assert.equal(restored.styleConflicts, 1);
+  assert.equal(restored.stylesRestored, 1);
+  assert.deepEqual(layers.map(layer => layer.direction), ['rtl', 'ltr', 'ltr']);
+  assert.deepEqual(pages.map(page => page.getPluginData('localization.page-direction.v1')), ['rtl', 'auto', '']);
+  assert.equal(activeId(), pages[0].id);
+});
+
+test('a file change during activation stops remaining writes and a second mutation cannot interleave', async () => {
+  const first = rtlText(), second = rtlText();
+  const pages = [page(first), page(second)];
+  const foreign = page(rtlText());
+  let finishNavigation;
+  const app = runtime(pages, { openPage() {
+    return new Promise(resolve => { finishNavigation = resolve; });
+  } });
+  const pending = app.switchDirection('rtl', { scope: 'file' });
+  const rejected = app.apply({ requestId: 2 });
+  assert.match(rejected.error, /in progress/);
+  app.penpot.currentPage = foreign;
+  app.penpot.currentFile = { id: 'foreign', pages: [foreign] };
+  finishNavigation();
+  await pending;
+  const result = app.messages.find(message => message.type === 'direction-result');
+  assert.equal(result.failedPages, 1);
+  assert.equal(result.styled, 1);
+  assert.equal(second.direction, 'ltr');
+  assert.equal(pages[1].getPluginData('localization.page-direction.v1'), '');
+  assert.equal(app.penpot.currentPage, foreign);
+  assert.deepEqual(app.history.map(([event]) => event), ['begin', 'finish']);
+});
+
+test('nested siblings reflect against a stable origin when their group bounds reflow', () => {
+  const left = withPluginData({ id: fixtureId('left'), x: 20, width: 20, constraintsHorizontal: 'left' });
+  const right = withPluginData({ id: fixtureId('right'), x: 70, width: 30, constraintsHorizontal: 'right' });
+  const group = withPluginData({ id: fixtureId('group'), children: [left, right],
+    constraintsHorizontal: 'left',
+    get x() { return Math.min(left.x, right.x); },
+    set x(value) {
+      const delta = value - this.x;
+      left.x += delta;
+      right.x += delta;
+    },
+    get width() { return Math.max(left.x + left.width, right.x + right.width) - this.x; }
+  });
+  const outer = withPluginData({ id: fixtureId('board'), x: 0, width: 300, children: [group] });
+  group.parent = outer;
+  left.parent = group;
+  right.parent = group;
+  const current = boardPage(outer, left, right, group);
+  const app = runtime([current]);
+  const switched = app.switchDirection('rtl');
+  assert.equal(switched.layoutConflicts, 0);
+  assert.deepEqual([group.x, left.x, right.x], [200, 260, 200]);
+  assert.equal(runtime([current]).restore().layoutConflicts, 0);
+  assert.deepEqual([group.x, left.x, right.x], [20, 20, 70]);
+});
+
+test('Restore continues to read absolute positions recorded by older versions', () => {
+  const child = withPluginData({ id: fixtureId('child'), x: 250, width: 30,
+    constraintsHorizontal: 'right' });
+  const board = withPluginData({ id: fixtureId('board'), x: 100, width: 200, children: [child] });
+  child.parent = board;
+  child.setPluginData('localization.rtl.v1', JSON.stringify({ version: 1, layout: {
+    active: 'rtl', baseline: { x: 120, constraintsHorizontal: 'left' },
+    rtlTarget: { x: 250, constraintsHorizontal: 'right' },
+    lastWritten: { x: 250, constraintsHorizontal: 'right' }
+  } }));
+  const app = runtime([boardPage(board, child)]);
+  assert.equal(app.restore().layoutsRestored, 1);
+  assert.deepEqual([child.x, child.constraintsHorizontal], [120, 'left']);
 });

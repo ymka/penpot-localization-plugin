@@ -13,7 +13,8 @@ let nextFixtureId = 0;
 async function ui(data, options = {}) {
   const elements = new Map();
   for (const id of ['language', 'scope', 'status', 'translation-file', 'choose-file', 'source',
-    'apply', 'restore', 'forget', 'remember-status', 'switch-ltr', 'switch-rtl', 'direction-status']) {
+    'apply', 'restore', 'forget', 'remember-status', 'switch-direction',
+    'target-direction', 'direction-choice', 'direction-status']) {
     const classes = new Set();
     elements.set(id, { value: id === 'scope' ? defaultScope : '', disabled: false,
       hidden: new RegExp(`<[^>]+id="${id}"[^>]*\\bhidden\\b`).test(html),
@@ -97,6 +98,7 @@ async function ui(data, options = {}) {
   const penpotEvents = {};
   const penpot = {
     on(type, callback) { penpotEvents[type] = callback; },
+    async openPage(id) { this.currentPage = this.currentFile.pages.find(page => page.id === id); },
     history: {
       undoBlockBegin() { const id = Symbol('history'); historyEvents.push(['begin', id]); return id; },
       undoBlockFinish(id) { historyEvents.push(['finish', id]); }
@@ -126,7 +128,7 @@ async function ui(data, options = {}) {
       set(value) { currentFile = normalizeFile(value); }
     }
   });
-  vm.runInNewContext(pluginScript, { penpot, TextEncoder, console: { error() {} } });
+  vm.runInNewContext(pluginScript, { penpot, TextEncoder, setTimeout, clearTimeout, console: { error() {} } });
   const document = { activeElement: null, getElementById: id => elements.get(id) };
   for (const element of elements.values()) {
     element.focus = () => { document.activeElement = element; };
@@ -189,7 +191,7 @@ test('status ignores foreign windows and displays parent warnings as text', asyn
     missing: ['<img src=x onerror=alert(1)>'], skipped: 0, failed: 2, failedPages: 0,
     conflicts: 0, styled: 0, mirrored: 0, layoutSkipped: 3, layoutUnsupported: 2,
     layoutSubtreesSkipped: 1, styleConflicts: 0, styleMetadataConflicts: 0,
-    layoutConflicts: 2, layoutMetadataConflicts: 1, styleFailed: 0, layoutFailed: 2,
+    layoutConflicts: 2, layoutMetadataConflicts: 1, styleFailed: 0, styleUnsupported: 0, layoutFailed: 2,
     layoutFailureReasons: { alignment: 0, constraints: 1, flexDirection: 0, margins: 0,
       metadata: 0, padding: 0, position: 1, target: 0 },
     rtl: false, layoutMirrored: false, layoutStateComplete: true,
@@ -721,6 +723,7 @@ test('default scope applies only to the current page and resets on reopening', a
   app.elements.get('scope').listeners.change();
   assert.equal(other.characters, 'Other original');
   app.elements.get('apply').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(other.characters, 'Hello');
   const reopened = await ui(undefined, { storage: app.storage });
   assert.equal(reopened.elements.get('language').value, 'EN');
@@ -749,6 +752,7 @@ test('a valid reimport automatically reapplies the selected language once using 
   app.elements.get('scope').listeners.change();
   assert.equal(writes.length, 1);
   await importFile(app, '{"ES":{"title":"After"}}');
+  await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(writes, [['current', 'Before'], ['current', 'After'], ['other', 'After']]);
   assert.equal(app.messages.length, 2);
   assert.equal(app.messages[1].requestId, 2);
@@ -988,7 +992,7 @@ test('restore reports page traversal and unreadable metadata without hiding text
   app.elements.get('restore').listeners.click();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(layer.characters, 'Original');
-  assert.match(app.elements.get('status').textContent, /1 page\(s\) could not be inspected/);
+  assert.match(app.elements.get('status').textContent, /1 page\(s\) could not be processed/);
   assert.equal(app.elements.get('status').classList.contains('error'), true);
 
   failUnfilteredTraversal = false;
@@ -1057,7 +1061,7 @@ test('failed automatic applies and transport errors release controls and allow r
   app.penpot.currentFile.pages = [app.penpot.currentPage];
   app.elements.get('apply').listeners.click();
   await new Promise(resolve => setImmediate(resolve));
-  assert.match(app.elements.get('status').textContent, /page\(s\) could not be inspected/);
+  assert.match(app.elements.get('status').textContent, /page\(s\) could not be processed/);
   assert.equal(app.elements.get('choose-file').disabled, false);
   app.penpot.currentPage = { findShapes: () => [layer] };
   app.penpot.currentFile.pages = [app.penpot.currentPage];
@@ -1139,6 +1143,7 @@ test('file-scoped reimport remains valid when the active page changes during rea
   app.penpot.currentPage = otherPage;
   finish(new TextEncoder().encode('{"EN":{"title":"After"}}').buffer);
   await pending;
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(current.characters, 'After');
   assert.equal(other.characters, 'After');
   assert.equal(app.messages.at(-1).scope, 'file');
@@ -1360,14 +1365,14 @@ function directionalPage(direction) {
 test('direction switches both text and layout without a dictionary and survives reopening', async () => {
   const { page, title, plain } = directionalPage('ltr');
   const app = await ui(undefined, { currentPage: page });
-  const rtl = app.elements.get('switch-rtl');
-  const ltr = app.elements.get('switch-ltr');
-  assert.equal(rtl.hidden, false);
-  assert.equal(ltr.hidden, true);
-  assert.equal(rtl.disabled, false);
+  const button = app.elements.get('switch-direction');
+  assert.equal(button.hidden, false);
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, 'Switch to RTL');
+  assert.equal(app.elements.get('direction-choice').hidden, true);
   assert.equal(app.elements.get('apply').disabled, true);
-  rtl.focus();
-  rtl.listeners.click();
+  button.focus();
+  button.listeners.click();
   await new Promise(resolve => setImmediate(resolve));
 
   assert.deepEqual(app.messages[0], { type: 'switch-direction', requestId: 1,
@@ -1376,59 +1381,73 @@ test('direction switches both text and layout without a dictionary and survives 
     ['Original', 'rtl', 'right', 150]);
   assert.deepEqual([plain.characters, plain.direction, plain.align], ['Brand', 'rtl', 'center']);
   assert.equal(app.historyEvents.length, 2);
-  assert.equal(app.document.activeElement, ltr);
-  assert.equal(rtl.hidden, true);
-  assert.equal(ltr.hidden, false);
+  assert.equal(app.document.activeElement, button);
+  assert.equal(button.textContent, 'Switch to LTR');
+  assert.equal(app.elements.get('direction-choice').hidden, true);
 
   const reopened = await ui({ EN: { title: 'Hello' } }, { currentPage: page });
   const select = reopened.elements.get('language');
-  assert.equal(reopened.elements.get('switch-ltr').hidden, false);
+  assert.equal(reopened.elements.get('switch-direction').textContent, 'Switch to LTR');
   select.value = 'EN';
   select.listeners.change();
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual([title.characters, title.direction, title.x], ['Hello', 'rtl', 150]);
-  reopened.elements.get('switch-ltr').listeners.click();
+  reopened.elements.get('switch-direction').listeners.click();
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual([title.characters, title.direction, title.align, title.x],
     ['Hello', 'ltr', 'left', 20]);
   assert.equal(select.value, 'EN');
 });
 
-test('navigation refreshes targets and mixed or unknown scopes expose both directions', async () => {
+test('navigation refreshes the switch and mixed or unknown scopes require an explicit target', async () => {
   const first = directionalPage('ltr');
   const other = directionalPage('rtl');
   const unknown = directionalPage(null);
   const app = await ui(undefined, { currentPage: first.page,
     pages: [first.page, other.page, unknown.page] });
-  const rtl = app.elements.get('switch-rtl');
-  const ltr = app.elements.get('switch-ltr');
+  const button = app.elements.get('switch-direction');
+  const choice = app.elements.get('direction-choice');
+  const target = app.elements.get('target-direction');
   app.penpot.currentPage = other.page;
   // A click based on the previous page's reply is rejected even before the page event arrives.
-  rtl.listeners.click();
+  button.listeners.click();
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual([first.title.direction, other.title.direction], ['ltr', 'rtl']);
   assert.match(app.elements.get('status').textContent, /Page changed/);
-  assert.equal(rtl.hidden, true);
-  assert.equal(ltr.hidden, false);
+  assert.equal(button.textContent, 'Switch to LTR');
+  assert.equal(choice.hidden, true);
 
   app.penpot.currentPage = unknown.page;
   await new Promise(resolve => setImmediate(resolve));
   assert.match(app.elements.get('direction-status').textContent, /Unknown/);
-  assert.equal(rtl.hidden, false);
-  assert.equal(ltr.hidden, false);
+  assert.equal(choice.hidden, false);
+  assert.equal(button.disabled, true);
+  button.listeners.click();
+  assert.equal(app.messages.length, 1, 'the switch requires a target');
+  target.value = 'rtl';
+  target.listeners.change();
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, 'Switch to RTL');
+  assert.equal(app.messages.length, 1, 'choosing a target does not write');
 
   const scope = app.elements.get('scope');
   scope.value = 'file';
   scope.listeners.change();
   await new Promise(resolve => setImmediate(resolve));
   assert.match(app.elements.get('direction-status').textContent, /Mixed/);
-  ltr.listeners.click();
+  assert.equal(choice.hidden, false);
+  assert.equal(target.value, '');
+  assert.equal(button.disabled, true);
+  target.value = 'ltr';
+  target.listeners.change();
+  button.listeners.click();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(app.messages.at(-1).scope, 'file');
   assert.equal(other.title.x, 20, 'an initially RTL page mirrors into LTR');
-  assert.equal(unknown.title.direction, 'ltr');
-  assert.equal(rtl.hidden, false);
-  assert.equal(ltr.hidden, true);
+  assert.equal(unknown.title.direction, null);
+  assert.match(app.elements.get('status').textContent, /kept their unset direction/);
+  assert.equal(button.textContent, 'Switch to RTL');
+  assert.equal(choice.hidden, true);
 });
 
 test('a partial direction switch reports skipped layers and ignores unrelated replies while busy', async () => {
@@ -1436,14 +1455,18 @@ test('a partial direction switch reports skipped layers and ignores unrelated re
   plain.direction = 'mixed';
   const replies = [];
   const app = await ui(undefined, { currentPage: page, holdDirectionReplies: replies });
-  const rtl = app.elements.get('switch-rtl');
-  assert.equal(app.elements.get('switch-ltr').hidden, false);
-  rtl.listeners.click();
+  const button = app.elements.get('switch-direction');
+  const target = app.elements.get('target-direction');
+  assert.equal(app.elements.get('direction-choice').hidden, false);
+  target.value = 'rtl';
+  target.listeners.change();
+  button.listeners.click();
   assert.equal(app.elements.get('translation-file').disabled, true);
-  assert.equal(rtl.disabled, true);
+  assert.equal(target.disabled, true);
+  assert.equal(button.disabled, true);
   app.events.message({ source: {}, data: replies[0] });
   app.events.message({ source: app.parent, data: { ...replies[0], type: 'localization-result' } });
-  assert.equal(rtl.disabled, true);
+  assert.equal(button.disabled, true);
 
   app.events.message({ source: app.parent, data: replies[0] });
   await new Promise(resolve => setImmediate(resolve));
@@ -1452,8 +1475,8 @@ test('a partial direction switch reports skipped layers and ignores unrelated re
   assert.equal(title.direction, 'rtl');
   assert.match(app.elements.get('status').textContent, /mixed direction or alignment/);
   assert.equal(app.elements.get('status').classList.contains('warning'), true);
-  assert.equal(app.elements.get('switch-ltr').hidden, false);
-  assert.equal(app.elements.get('switch-rtl').hidden, true);
+  assert.equal(button.textContent, 'Switch to LTR');
+  assert.equal(app.elements.get('direction-choice').hidden, true);
 });
 
 test('Arabic application updates text direction and reports RTL styling without changing JSON', async () => {
@@ -1507,10 +1530,13 @@ test('RTL text previously applied by language can still switch its LTR layout to
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual([title.characters, title.direction, title.x], ['مرحبا', 'rtl', 20]);
   assert.match(app.elements.get('direction-status').textContent, /Mixed/);
-  app.elements.get('switch-rtl').listeners.click();
+  const target = app.elements.get('target-direction');
+  target.value = 'rtl';
+  target.listeners.change();
+  app.elements.get('switch-direction').listeners.click();
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual([title.characters, title.direction, title.x], ['مرحبا', 'rtl', 150]);
-  assert.equal(app.elements.get('switch-ltr').hidden, false);
+  assert.equal(app.elements.get('switch-direction').textContent, 'Switch to LTR');
 });
 
 test('a layout confirmation failure reports partial success and can be recovered after reopening', async () => {
@@ -1525,15 +1551,15 @@ test('a layout confirmation failure reports partial success and can be recovered
     setPluginData(key, value);
   };
   const app = await ui(undefined, { currentPage: page });
-  app.elements.get('switch-rtl').listeners.click();
+  app.elements.get('switch-direction').listeners.click();
   await new Promise(resolve => setImmediate(resolve));
-  app.elements.get('switch-ltr').listeners.click();
+  app.elements.get('switch-direction').listeners.click();
   await new Promise(resolve => setImmediate(resolve));
 
   assert.deepEqual([title.direction, title.x, title.constraintsHorizontal], ['ltr', 20, 'left']);
   assert.match(app.elements.get('status').textContent, /recovery metadata: 1/);
   assert.equal(app.elements.get('status').classList.contains('warning'), true);
-  assert.equal(app.elements.get('switch-rtl').hidden, false);
+  assert.equal(app.elements.get('direction-choice').hidden, false);
   assert.match(title.getPluginData('localization.rtl.v1'), /pending-baseline/);
 
   const reopened = await ui(undefined, { currentPage: page });
@@ -1541,4 +1567,31 @@ test('a layout confirmation failure reports partial success and can be recovered
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual([title.direction, title.x, title.characters], ['ltr', 20, 'Original']);
   assert.equal(reopened.elements.get('restore').disabled, true);
+});
+
+test('an incomplete direction switch exposes its retry and completes after metadata is writable', async () => {
+  const { page, title } = directionalPage('ltr');
+  const setData = title.setPluginData;
+  title.setPluginData = () => {};
+  const app = await ui(undefined, { currentPage: page });
+  const button = app.elements.get('switch-direction');
+  const choice = app.elements.get('direction-choice');
+  const target = app.elements.get('target-direction');
+  button.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(app.elements.get('direction-status').textContent, /Conversion incomplete/);
+  assert.equal(choice.hidden, false);
+  assert.equal(target.value, 'rtl', 'the failed target stays selected for retry');
+  assert.equal(button.textContent, 'Switch to RTL');
+  assert.equal(button.disabled, false);
+  assert.deepEqual([title.direction, title.x], ['ltr', 20]);
+
+  title.setPluginData = setData;
+  button.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(app.elements.get('direction-status').textContent, /Direction: RTL/);
+  assert.equal(choice.hidden, true);
+  assert.equal(button.textContent, 'Switch to LTR');
+  assert.equal(button.disabled, false);
+  assert.deepEqual([title.direction, title.x], ['rtl', 150]);
 });
