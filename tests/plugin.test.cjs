@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { readFileSync } = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
-const root = path.join(__dirname, '..');
+const root = path.join(__dirname, '..', 'plugin');
 const code = readFileSync(path.join(root, 'plugin.js'), 'utf8');
 let nextFixtureId = 0;
 const fixtureId = prefix => `${prefix}-${++nextFixtureId}`;

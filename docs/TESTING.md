@@ -48,6 +48,10 @@ Record each run's date, revision, `penpot.version`, browser/OS versions, sanitiz
 
 ## Validation record
 
+### Plugin runtime directory — 2026-11-26
+
+Moved the four runtime files into `plugin/`. Both JavaScript syntax checks, all 116 mocked plugin/UI tests, all four in-memory HTTP tests, and `git diff --check` passed. The HTTP tests compare all four original asset URLs against the relocated files and verify that the development server rejects `/plugin/` and `/plugin/manifest.json`. The UI wiring test checks relative script URLs at the root and under a repository-style subpath. Live Penpot and deployed HTTPS hosting were not exercised.
+
 ### External UI script — 2026-11-26
 
 Moved the UI script into `ui.js`. Compared it with the former inline script after normalizing indentation and verified that the HTML and CSS match apart from the script reference.
