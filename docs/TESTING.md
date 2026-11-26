@@ -17,7 +17,7 @@ Run the Node suite for plugin/UI/message changes, the Python suite for server ch
 | [UI](../tests/ui.test.cjs) | Shipped inline script and adapter together with DOM/Penpot/storage/history stubs and real Blob byte reads: startup/reopening, pre-read context capture, page/file navigation races, local imports, dynamic languages, invalid/canceled retention, limits/BOM/Unicode, malformed UTF-8 rejection, automatic/manual apply, session restore scope/lifetime/conflicts/layers deleted outside the plugin, operation locks, source/text rendering, per-file save/forget, transport/storage failures, result validation, and stale/foreign/malformed replies. |
 | [Server](../tests/test_server.py) | Actual handler with in-memory HTTP connections: allowed assets, private/traversal/symlink rejection, query strings, HEAD, preflight, and headers. |
 
-GitHub Actions runs both commands on `ubuntu-latest` with Node.js 22 and Python 3.14, without installing project dependencies. The local development server supports Python 3.9 and later. These tests do not establish browser policy, Penpot layout/style/font behavior, or undo/restore correctness.
+GitHub Actions runs both commands on `ubuntu-latest` with Node.js 22 and Python 3.14, without installing project dependencies. The test job runs when a pull request is opened or receives new commits, and after a pull request merges into `main`. The local development server supports Python 3.9 and later. These tests do not establish browser policy, Penpot layout/style/font behavior, or undo/restore correctness.
 
 ## Optional Penpot compatibility checks
 
