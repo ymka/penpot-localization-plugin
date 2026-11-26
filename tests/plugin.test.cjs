@@ -24,6 +24,7 @@ const page = (...layers) => {
     if (!layer.id) layer.id = fixtureId('shape');
   }
   return { id: fixtureId('page'), findShapes(criteria) {
+    if (criteria?.type === 'board') return [];
     if (criteria) assert.equal(criteria.type, 'text');
     return layers;
   }, getShapeById(id) { return layers.find(layer => layer.id === id) || null; } };
@@ -31,6 +32,7 @@ const page = (...layers) => {
 
 function preparePage(candidate) {
   if (!candidate.id) candidate.id = fixtureId('page');
+  if (!candidate.getPluginData) withPluginData(candidate);
   if (!candidate.getShapeById) {
     let knownLayers = [];
     const findShapes = candidate.findShapes.bind(candidate);
@@ -68,8 +70,11 @@ function runtime(pages = [page()], overrides = {}) {
   vm.runInNewContext(code, { penpot, TextEncoder, console: { error: (...args) => errors.push(args) } });
   return { opened, messages, errors, history, penpot, send: receive, apply(extra = {}) {
     receive({ type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page',
-      updateRtlLayout: true, mirrorRtlLayout: false,
       translations: { ES: { 'login.title': 'Hola' } }, ...extra });
+    return messages.at(-1);
+  }, switchDirection(direction, extra = {}) {
+    receive({ type: 'switch-direction', requestId: 1, fileId: 'file-a', scope: 'page',
+      pageId: penpot.currentPage.id, direction, ...extra });
     return messages.at(-1);
   }, restore(extra = {}) {
     receive({ type: 'restore-localization', requestId: 2, fileId: 'file-a', scope: 'page', ...extra });
@@ -181,7 +186,7 @@ test('invalid requests and absent file context never write', () => {
   const app = runtime([page(layer)]);
   for (const request of [{ language: 'DE' }, { scope: 'selection' },
     { translations: null }, { translations: { ES: [] } }, { translations: { ES: 'bad' } },
-    { pageId: 42 }, { updateRtlLayout: undefined }, { mirrorRtlLayout: null }]) {
+    { pageId: 42 }]) {
     assert.equal(app.apply(request).ok, false);
     assert.equal(layer.characters, 'Original');
   }
@@ -190,7 +195,7 @@ test('invalid requests and absent file context never write', () => {
   }
   app.send(null);
   app.send({ type: 'unrelated' });
-  assert.equal(app.messages.length, 8);
+  assert.equal(app.messages.length, 6);
 });
 
 test('setter failure is counted and remaining layers still update', () => {
@@ -382,7 +387,7 @@ test('page traversal errors remain visible without concealing partial results', 
   assert.equal(result.failedPages, 1);
 });
 
-test('baseline apply and Restore report unfiltered page traversal failures', () => {
+test('direction and Restore report unfiltered page traversal failures', () => {
   const layer = rtlText();
   const brokenPage = { id: 'baseline-traversal-page',
     findShapes(criteria) {
@@ -395,8 +400,10 @@ test('baseline apply and Restore report unfiltered page traversal failures', () 
   const applied = app.apply({ language: 'EN',
     translations: { EN: { 'login.title': 'Hello' } } });
   assert.equal(applied.changed, 1);
-  assert.equal(applied.failedPages, 1);
+  assert.equal(applied.failedPages, 0);
   assert.equal(layer.characters, 'Hello');
+  assert.equal(app.switchDirection('rtl').failedPages, 1);
+  assert.equal(layer.direction, 'ltr');
 
   const restored = app.restore();
   assert.equal(restored.restored, 1);
@@ -735,8 +742,7 @@ test('unsupported optional flex values are skipped instead of written', () => {
     getShapeById(id) { return id === board.id ? board : null; } };
 
   const app = runtime([layoutPage]);
-  const result = app.apply({ language: 'ar', mirrorRtlLayout: true,
-    translations: { ar: {} } });
+  const result = app.switchDirection('rtl');
 
   assert.equal(result.failed, 0);
   assert.equal(result.mirrored, 0);
@@ -762,8 +768,7 @@ test('unsupported flex fields are reported alongside supported updates', () => {
     },
     getShapeById(id) { return id === board.id ? board : null; } };
 
-  const result = runtime([layoutPage]).apply({ language: 'ar', mirrorRtlLayout: true,
-    translations: { ar: {} } });
+  const result = runtime([layoutPage]).switchDirection('rtl');
 
   assert.equal(result.mirrored, 1);
   assert.equal(flex.dir, 'row-reverse');
@@ -799,8 +804,7 @@ test('one rejected layout property does not block supported properties on the sa
     getShapeById(id) { return id === board.id ? board : null; } };
 
   const app = runtime([layoutPage]);
-  const result = app.apply({ language: 'ar', mirrorRtlLayout: true,
-    translations: { ar: {} } });
+  const result = app.switchDirection('rtl');
 
   assert.equal(result.failed, 1);
   assert.equal(result.layoutFailed, 1);
@@ -886,8 +890,7 @@ test('managed RTL layout mirrors supported board contents and reverses idempoten
     getShapeById(id) { return shapes.find(shape => shape.id === id) || null; }
   };
   const app = runtime([layoutPage]);
-  const rtl = app.apply({ language: 'ar', mirrorRtlLayout: true,
-    translations: { ar: { 'login.title': 'مرحبا' } } });
+  const rtl = app.switchDirection('rtl');
   assert.equal(rtl.layoutSkipped, 2);
   assert.equal(rtl.layoutSubtreesSkipped, 2);
   assert.equal(rtl.layoutUnsupported, 0);
@@ -907,16 +910,15 @@ test('managed RTL layout mirrors supported board contents and reverses idempoten
   assert.equal(grid.x, 0);
   assert.equal(component.x, 0);
 
-  const repeated = app.apply({ requestId: 2, language: 'ar', mirrorRtlLayout: true,
-    translations: { ar: { 'login.title': 'مرحبا' } } });
+  const repeated = app.switchDirection('rtl', { requestId: 2 });
   assert.equal(repeated.mirrored, 0);
-  const reversed = app.apply({ requestId: 3, language: 'ar', mirrorRtlLayout: false,
-    translations: { ar: { 'login.title': 'مرحبا' } } });
+  const reversed = app.switchDirection('ltr', { requestId: 3 });
   assert.ok(reversed.mirrored >= 3);
   assert.equal(flexBoard.x, 120);
   assert.equal(flexBoard.flex.alignItems, 'start');
   assert.equal(plainChild.x, 240);
-  assert.equal(label.direction, 'rtl');
+  assert.equal(label.direction, 'ltr');
+  assert.equal(label.characters, 'Original');
 });
 
 test('reapplying mirrored layout refreshes targets after baseline geometry changes', () => {
@@ -937,13 +939,11 @@ test('reapplying mirrored layout refreshes targets after baseline geometry chang
     getShapeById(id) { return shapes.find(shape => shape.id === id) || null; } };
   const app = runtime([layoutPage]);
 
-  app.apply({ language: 'ar', mirrorRtlLayout: true, translations: { ar: {} } });
-  app.apply({ requestId: 2, language: 'ar', mirrorRtlLayout: false,
-    translations: { ar: {} } });
+  app.switchDirection('rtl');
+  app.switchDirection('ltr', { requestId: 2 });
   child.width = 50;
   board.width = 300;
-  const reapplied = app.apply({ requestId: 3, language: 'ar', mirrorRtlLayout: true,
-    translations: { ar: {} } });
+  const reapplied = app.switchDirection('rtl', { requestId: 3 });
 
   assert.equal(reapplied.layoutConflicts, 0);
   assert.equal(child.x, 230);
@@ -967,11 +967,10 @@ test('reapplying mirrored layout refreshes targets after mirrored geometry chang
     getShapeById(id) { return shapes.find(shape => shape.id === id) || null; } };
   const app = runtime([layoutPage]);
 
-  app.apply({ language: 'ar', mirrorRtlLayout: true, translations: { ar: {} } });
+  app.switchDirection('rtl');
   board.width = 300;
   child.width = 50;
-  const reapplied = app.apply({ requestId: 2, language: 'ar', mirrorRtlLayout: true,
-    translations: { ar: {} } });
+  const reapplied = app.switchDirection('rtl', { requestId: 2 });
 
   assert.equal(reapplied.layoutConflicts, 0);
   assert.equal(child.x, 230);
@@ -1009,11 +1008,61 @@ test('externally changed mirrored geometry is reported and never overwritten', (
     },
     getShapeById(id) { return [board, child].find(shape => shape.id === id) || null; } };
   const app = runtime([layoutPage]);
-  app.apply({ language: 'ar', mirrorRtlLayout: true, translations: { ar: {} } });
+  app.switchDirection('rtl');
   assert.equal(child.x, 150);
   child.x = 140;
-  const result = app.apply({ requestId: 2, language: 'EN', mirrorRtlLayout: false,
-    translations: { EN: {} } });
+  const result = app.switchDirection('ltr', { requestId: 2 });
   assert.equal(result.layoutConflicts, 1);
   assert.equal(child.x, 140);
+});
+
+test('direction rejects stale, malformed and cross-file requests without writes', () => {
+  const layer = rtlText();
+  const current = page(layer);
+  const other = page(rtlText());
+  const app = runtime([current, other]);
+  for (const request of [{ direction: 'mixed' }, { pageId: undefined }, { pageId: other.id },
+    { fileId: 'another-file' }, { scope: 'selection' }]) {
+    assert.equal(app.switchDirection('rtl', request).ok, false);
+    assert.equal(layer.direction, 'ltr');
+    assert.equal(layer.getPluginData('localization.rtl.v1'), '');
+    assert.equal(current.getPluginData('localization.page-direction.v1'), '');
+  }
+  const replyCount = app.messages.length;
+  app.switchDirection('rtl', { requestId: 0 });
+  assert.equal(app.messages.length, replyCount);
+  assert.deepEqual(app.history, []);
+});
+
+test('rejected page metadata prevents direction setters while other pages can switch', () => {
+  const layer = rtlText();
+  const sibling = rtlText();
+  const broken = withPluginData(page(layer));
+  broken.setPluginData = () => { throw new Error('Page metadata rejected'); };
+  const safe = page(sibling);
+  const app = runtime([broken, safe]);
+  const result = app.switchDirection('rtl', { scope: 'file' });
+  assert.equal(result.failedPages, 1);
+  assert.equal(result.styled, 1);
+  assert.equal(layer.direction, 'ltr');
+  assert.equal(layer.getPluginData('localization.rtl.v1'), '');
+  assert.equal(sibling.direction, 'rtl');
+  assert.equal(safe.getPluginData('localization.page-direction.v1'), 'rtl');
+  assert.deepEqual(app.history.map(([event]) => event), ['begin', 'finish']);
+});
+
+test('Restore after reopening returns a native RTL page to baseline and clears its chosen direction', () => {
+  const layer = rtlText('Untagged', 'Original', 'right');
+  layer.direction = 'rtl';
+  const current = page(layer);
+  const app = runtime([current]);
+  assert.equal(app.switchDirection('ltr').styled, 1);
+  assert.deepEqual([layer.direction, layer.align], ['ltr', 'left']);
+  const reopened = runtime([current]);
+  assert.equal(reopened.restore().stylesRestored, 1);
+  assert.deepEqual([layer.direction, layer.align, layer.characters], ['rtl', 'right', 'Original']);
+  assert.equal(current.getPluginData('localization.page-direction.v1'), 'auto');
+  reopened.send({ type: 'recovery-status-request', requestId: 3, fileId: 'file-a', scope: 'page' });
+  assert.equal(reopened.messages.at(-1).direction, 'rtl');
+  assert.equal(reopened.messages.at(-1).restoreAvailable, false);
 });

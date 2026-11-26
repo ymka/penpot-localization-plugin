@@ -13,10 +13,9 @@ let nextFixtureId = 0;
 async function ui(data, options = {}) {
   const elements = new Map();
   for (const id of ['language', 'scope', 'status', 'translation-file', 'choose-file', 'source',
-    'apply', 'restore', 'forget', 'remember-status', 'mirror-rtl-layout']) {
+    'apply', 'restore', 'forget', 'remember-status', 'switch-ltr', 'switch-rtl', 'direction-status']) {
     const classes = new Set();
     elements.set(id, { value: id === 'scope' ? defaultScope : '', disabled: false,
-      checked: false,
       hidden: new RegExp(`<[^>]+id="${id}"[^>]*\\bhidden\\b`).test(html),
       clicks: 0, click() { this.clicks++; },
       textContent: id === 'source' ? 'Source: no file selected' : '', files: [], children: [], replaceChildren(...options) { this.children = options; },
@@ -38,12 +37,11 @@ async function ui(data, options = {}) {
   const messages = [];
   const storageRequests = [];
   const contextRequests = [];
-  const preferenceRequests = [];
   const recoveryRequests = [];
   let receive;
   const parent = { postMessage(msg) {
     const message = JSON.parse(JSON.stringify(msg));
-    if (message.type === 'apply-language' || message.type === 'restore-localization') {
+    if (['apply-language', 'restore-localization', 'switch-direction'].includes(message.type)) {
       if (options.failApplySend) throw new Error('Cannot post message');
       messages.push(message);
     }
@@ -51,7 +49,6 @@ async function ui(data, options = {}) {
       if (options.failContextSend) throw new Error('Cannot post message');
       contextRequests.push(message);
     }
-    else if (message.type === 'rtl-preference-request') preferenceRequests.push(message);
     else if (message.type === 'recovery-status-request') recoveryRequests.push(message);
     else {
       if (options.failStorageSend === message.action) throw new Error('SANITIZED transport details');
@@ -67,6 +64,11 @@ async function ui(data, options = {}) {
     if (!candidate.id) candidate.id = `page-${++nextFixtureId}`;
     if (normalizedPages.has(candidate)) return candidate;
     normalizedPages.add(candidate);
+    if (!candidate.getPluginData) {
+      const pageData = new Map();
+      candidate.getPluginData = key => pageData.get(key) || '';
+      candidate.setPluginData = (key, value) => pageData.set(key, value);
+    }
     let knownLayers = [];
     const findShapes = candidate.findShapes.bind(candidate);
     candidate.findShapes = criteria => {
@@ -92,7 +94,9 @@ async function ui(data, options = {}) {
   let currentFile = normalizeFile({ id: options.fileId || 'file-a',
     pages: options.pages === undefined ? [currentPage] : options.pages });
   const historyEvents = [];
+  const penpotEvents = {};
   const penpot = {
+    on(type, callback) { penpotEvents[type] = callback; },
     history: {
       undoBlockBegin() { const id = Symbol('history'); historyEvents.push(['begin', id]); return id; },
       undoBlockFinish(id) { historyEvents.push(['finish', id]); }
@@ -104,6 +108,7 @@ async function ui(data, options = {}) {
     },
     ui: { open() {}, onMessage(fn) { receive = fn; }, sendMessage(data) {
       if (options.holdReplies && data.type === 'saved-import-result') options.holdReplies.push(data);
+      else if (options.holdDirectionReplies && data.type === 'direction-result') options.holdDirectionReplies.push(data);
       else if (options.holdApplyReplies && data.type === 'localization-result') options.holdApplyReplies.push(data);
       else if (options.holdRestoreReplies && data.type === 'restore-result') options.holdRestoreReplies.push(data);
       else if (options.holdContextReplies && data.type === 'design-context-result') options.holdContextReplies.push(data);
@@ -114,7 +119,7 @@ async function ui(data, options = {}) {
   Object.defineProperties(penpot, {
     currentPage: {
       get() { return normalizePage(currentPage); },
-      set(value) { currentPage = normalizePage(value); }
+      set(value) { currentPage = normalizePage(value); penpotEvents.pagechange?.(currentPage); }
     },
     currentFile: {
       get() { return normalizeFile(currentFile); },
@@ -135,7 +140,7 @@ async function ui(data, options = {}) {
   vm.runInContext(script, context);
   await new Promise(resolve => setImmediate(resolve));
   const app = { elements, events, parent, messages, storageRequests, contextRequests,
-    preferenceRequests, recoveryRequests, storage,
+    recoveryRequests, storage,
     penpot, document, historyEvents };
   if (data !== undefined) await importFile(app, JSON.stringify(data));
   return app;
@@ -152,7 +157,7 @@ test('loaded dictionary enables selection and sends selected scope and language'
   assert.equal(app.messages.length, 1);
   assert.deepEqual(app.messages[0], {
     type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page',
-    updateRtlLayout: false, mirrorRtlLayout: false, translations: dictionary
+    translations: dictionary
   });
 });
 
@@ -1331,174 +1336,124 @@ test('Choose a language is a disabled placeholder after imports and reset', asyn
   assert.equal(app.messages.length, 1);
 });
 
-test('automatic language application preserves the manual checkbox choice', async () => {
-  const storage = new Map([['localization.rtl-layout.v1:file-a', 'true']]);
-  const app = await ui({ ar: { title: 'مرحبا' }, EN: { title: 'Hello' } }, { storage });
-  const checkbox = app.elements.get('mirror-rtl-layout');
-  assert.equal(checkbox.checked, false, 'legacy saved preferences are ignored');
-  assert.equal(app.messages.length, 0);
-  assert.equal(app.preferenceRequests.length, 0);
+function directionalPage(direction) {
+  const root = { id: 'root' };
+  const makeShape = (shape) => {
+    const data = new Map();
+    return { ...shape, getPluginData: key => data.get(key) || '',
+      setPluginData: (key, value) => data.set(key, value) };
+  };
+  const board = makeShape({ id: 'board', x: 0, width: 200, parent: root });
+  const title = makeShape({ id: 'title', name: 'i18n.title', characters: 'Original',
+    direction, align: direction === 'rtl' ? 'right' : 'left', x: direction === 'rtl' ? 150 : 20,
+    width: 30, constraintsHorizontal: direction === 'rtl' ? 'right' : 'left', parent: board });
+  const plain = makeShape({ id: 'plain', name: 'Untagged', characters: 'Brand',
+    direction, align: 'center' });
+  board.children = [title];
+  const page = { root, findShapes(criteria) {
+    if (!criteria) return [board, title, plain];
+    return criteria.type === 'board' ? [board] : [title, plain];
+  }, getShapeById(id) { return [board, title, plain].find(shape => shape.id === id) || null; } };
+  return { page, title, plain };
+}
 
-  checkbox.checked = true;
-  checkbox.listeners.change();
-  app.elements.get('language').value = 'ar';
-  app.elements.get('language').listeners.change();
+test('direction switches both text and layout without a dictionary and survives reopening', async () => {
+  const { page, title, plain } = directionalPage('ltr');
+  const app = await ui(undefined, { currentPage: page });
+  const rtl = app.elements.get('switch-rtl');
+  const ltr = app.elements.get('switch-ltr');
+  assert.equal(rtl.hidden, false);
+  assert.equal(ltr.hidden, true);
+  assert.equal(rtl.disabled, false);
+  assert.equal(app.elements.get('apply').disabled, true);
+  rtl.focus();
+  rtl.listeners.click();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(app.messages[0].updateRtlLayout, false);
-  assert.equal(app.messages[0].mirrorRtlLayout, true);
-  assert.equal(checkbox.checked, true, 'language change preserves the pending manual choice');
 
-  await importFile(app, '{"ar":{"title":"مرحبا ثانية"},"EN":{"title":"Hello"}}');
-  assert.equal(app.messages[1].updateRtlLayout, false);
-  assert.equal(app.messages[1].mirrorRtlLayout, true);
-  assert.equal(checkbox.checked, true, 'automatic reimport also preserves the choice');
+  assert.deepEqual(app.messages[0], { type: 'switch-direction', requestId: 1,
+    fileId: 'file-a', scope: 'page', pageId: page.id, direction: 'rtl' });
+  assert.deepEqual([title.characters, title.direction, title.align, title.x],
+    ['Original', 'rtl', 'right', 150]);
+  assert.deepEqual([plain.characters, plain.direction, plain.align], ['Brand', 'rtl', 'center']);
+  assert.equal(app.historyEvents.length, 2);
+  assert.equal(app.document.activeElement, ltr);
+  assert.equal(rtl.hidden, true);
+  assert.equal(ltr.hidden, false);
 
-  checkbox.checked = true;
-  checkbox.listeners.change();
-  app.elements.get('apply').listeners.click();
+  const reopened = await ui({ EN: { title: 'Hello' } }, { currentPage: page });
+  const select = reopened.elements.get('language');
+  assert.equal(reopened.elements.get('switch-ltr').hidden, false);
+  select.value = 'EN';
+  select.listeners.change();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(app.messages[2].updateRtlLayout, true);
-  assert.equal(app.messages[2].mirrorRtlLayout, true,
-    'the manual request captures the checked request');
-  assert.equal(checkbox.checked, false, 'the result still reports no mirrored layout');
-  assert.equal(app.preferenceRequests.length, 0);
-  assert.equal(storage.get('localization.rtl-layout.v1:file-a'), 'true',
-    'legacy data is neither restored nor rewritten');
-
-  const reopened = await ui(undefined, { storage });
-  assert.equal(reopened.elements.get('mirror-rtl-layout').checked, false);
-
-  const failed = await ui({ ar: { title: 'مرحبا' } }, { failApplySend: true });
-  const failedCheckbox = failed.elements.get('mirror-rtl-layout');
-  assert.equal(failedCheckbox.checked, false);
-  failed.elements.get('language').value = 'ar';
-  failed.elements.get('language').listeners.change();
-  assert.equal(failedCheckbox.checked, false,
-    'a failed automatic apply does not claim that mirroring was applied');
+  assert.deepEqual([title.characters, title.direction, title.x], ['Hello', 'rtl', 150]);
+  reopened.elements.get('switch-ltr').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([title.characters, title.direction, title.align, title.x],
+    ['Hello', 'ltr', 'left', 20]);
+  assert.equal(select.value, 'EN');
 });
 
-test('only manual Apply changes managed layout while language changes preserve it', async () => {
-  const rootShape = { id: 'root' };
-  const pluginData = new Map();
-  const child = { id: 'automatic-layout-child', x: 20, width: 30,
-    constraintsHorizontal: 'left', children: [], isComponentInstance: () => false,
-    getPluginData: key => pluginData.get(key) || '',
-    setPluginData: (key, value) => pluginData.set(key, value) };
-  const board = { id: 'automatic-layout-board', x: 0, width: 200, parent: rootShape,
-    children: [child], isComponentInstance: () => false,
-    getPluginData: () => '', setPluginData() {} };
-  child.parent = board;
-  const currentPage = { root: rootShape, findShapes(criteria) {
-    if (!criteria) return [board, child];
-    if (criteria.type === 'text') return [];
-    if (criteria.type === 'board') return [board];
-    return [];
-  }, getShapeById(id) { return [board, child].find(shape => shape.id === id) || null; } };
-  const app = await ui({ ar: {}, EN: {} }, { currentPage });
-  const checkbox = app.elements.get('mirror-rtl-layout');
-
-  app.elements.get('language').value = 'ar';
-  app.elements.get('language').listeners.change();
+test('navigation refreshes targets and mixed or unknown scopes expose both directions', async () => {
+  const first = directionalPage('ltr');
+  const other = directionalPage('rtl');
+  const unknown = directionalPage(null);
+  const app = await ui(undefined, { currentPage: first.page,
+    pages: [first.page, other.page, unknown.page] });
+  const rtl = app.elements.get('switch-rtl');
+  const ltr = app.elements.get('switch-ltr');
+  app.penpot.currentPage = other.page;
+  // A click based on the previous page's reply is rejected even before the page event arrives.
+  rtl.listeners.click();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(app.messages[0].updateRtlLayout, false);
-  assert.equal(child.x, 20);
-  assert.equal(child.constraintsHorizontal, 'left');
-  assert.equal(checkbox.checked, false);
+  assert.deepEqual([first.title.direction, other.title.direction], ['ltr', 'rtl']);
+  assert.match(app.elements.get('status').textContent, /Page changed/);
+  assert.equal(rtl.hidden, true);
+  assert.equal(ltr.hidden, false);
 
-  checkbox.checked = true;
-  checkbox.listeners.change();
-  app.elements.get('apply').listeners.click();
+  app.penpot.currentPage = unknown.page;
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(app.messages[1].updateRtlLayout, true);
-  assert.equal(child.x, 150);
-  assert.equal(child.constraintsHorizontal, 'right');
-  assert.equal(checkbox.checked, true);
+  assert.match(app.elements.get('direction-status').textContent, /Unknown/);
+  assert.equal(rtl.hidden, false);
+  assert.equal(ltr.hidden, false);
 
-  const mirroredReopen = await ui(undefined, { currentPage });
-  assert.equal(mirroredReopen.elements.get('mirror-rtl-layout').checked, true,
-    'startup recovery status reflects durable mirrored layout');
-
-  app.elements.get('language').value = 'EN';
-  app.elements.get('language').listeners.change();
+  const scope = app.elements.get('scope');
+  scope.value = 'file';
+  scope.listeners.change();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(app.messages[2].updateRtlLayout, false);
-  assert.equal(child.x, 150);
-  assert.equal(child.constraintsHorizontal, 'right');
-  assert.equal(checkbox.checked, true, 'LTR text application preserves mirrored layout');
-
-  app.elements.get('language').value = 'ar';
-  app.elements.get('language').listeners.change();
+  assert.match(app.elements.get('direction-status').textContent, /Mixed/);
+  ltr.listeners.click();
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(app.messages[3].updateRtlLayout, false);
-  assert.equal(child.x, 150);
-  assert.equal(child.constraintsHorizontal, 'right');
-  assert.equal(checkbox.checked, true);
-
-  checkbox.checked = false;
-  checkbox.listeners.change();
-  app.elements.get('apply').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(app.messages[4].updateRtlLayout, true);
-  assert.equal(child.x, 20);
-  assert.equal(child.constraintsHorizontal, 'left');
-  assert.equal(checkbox.checked, false);
-
-  const baselineReopen = await ui(undefined, { currentPage });
-  assert.equal(baselineReopen.elements.get('mirror-rtl-layout').checked, false,
-    'startup recovery status reflects the restored baseline');
+  assert.equal(app.messages.at(-1).scope, 'file');
+  assert.equal(other.title.x, 20, 'an initially RTL page mirrors into LTR');
+  assert.equal(unknown.title.direction, 'ltr');
+  assert.equal(rtl.hidden, false);
+  assert.equal(ltr.hidden, true);
 });
 
-test('English manual Apply keeps an unchecked target after a pending baseline confirmation', async () => {
-  const rootShape = { id: 'root' };
-  const pluginData = new Map();
-  let metadataWrites = 0;
-  const child = { id: 'english-layout-child', x: 20, width: 30,
-    constraintsHorizontal: 'left', children: [], isComponentInstance: () => false,
-    getPluginData: key => pluginData.get(key) || '',
-    setPluginData(key, value) {
-      metadataWrites++;
-      if (metadataWrites === 4) throw new Error('SANITIZED final metadata failure');
-      pluginData.set(key, value);
-    } };
-  const board = { id: 'english-layout-board', x: 0, width: 200, parent: rootShape,
-    children: [child], isComponentInstance: () => false,
-    getPluginData: () => '', setPluginData() {} };
-  child.parent = board;
-  const currentPage = { root: rootShape, findShapes(criteria) {
-    if (!criteria) return [board, child];
-    if (criteria.type === 'text') return [];
-    if (criteria.type === 'board') return [board];
-    return [];
-  }, getShapeById(id) { return [board, child].find(shape => shape.id === id) || null; } };
-  const app = await ui({ EN: {} }, { currentPage });
+test('a partial direction switch reports skipped layers and ignores unrelated replies while busy', async () => {
+  const { page, title, plain } = directionalPage('ltr');
+  plain.direction = 'mixed';
+  const replies = [];
+  const app = await ui(undefined, { currentPage: page, holdDirectionReplies: replies });
+  const rtl = app.elements.get('switch-rtl');
+  assert.equal(app.elements.get('switch-ltr').hidden, false);
+  rtl.listeners.click();
+  assert.equal(app.elements.get('translation-file').disabled, true);
+  assert.equal(rtl.disabled, true);
+  app.events.message({ source: {}, data: replies[0] });
+  app.events.message({ source: app.parent, data: { ...replies[0], type: 'localization-result' } });
+  assert.equal(rtl.disabled, true);
 
-  app.elements.get('language').value = 'EN';
-  app.elements.get('language').listeners.change();
+  app.events.message({ source: app.parent, data: replies[0] });
   await new Promise(resolve => setImmediate(resolve));
-  app.elements.get('mirror-rtl-layout').checked = true;
-  app.elements.get('mirror-rtl-layout').listeners.change();
-  app.elements.get('apply').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
-
-  assert.equal(app.messages[1].language, 'EN');
-  assert.equal(app.messages[1].updateRtlLayout, true);
-  assert.equal(app.messages[1].mirrorRtlLayout, true);
-  assert.equal(child.x, 150);
-  assert.equal(child.constraintsHorizontal, 'right');
-  assert.equal(app.elements.get('mirror-rtl-layout').checked, true);
-
-  app.elements.get('mirror-rtl-layout').checked = false;
-  app.elements.get('mirror-rtl-layout').listeners.change();
-  app.elements.get('apply').listeners.click();
-  await new Promise(resolve => setImmediate(resolve));
-
-  assert.equal(app.messages[2].language, 'EN');
-  assert.equal(app.messages[2].updateRtlLayout, true);
-  assert.equal(app.messages[2].mirrorRtlLayout, false);
-  assert.equal(child.x, 20);
-  assert.equal(child.constraintsHorizontal, 'left');
-  assert.equal(app.elements.get('mirror-rtl-layout').checked, false);
-  assert.match(app.elements.get('status').textContent, /recovery metadata: 1/);
+  assert.equal(app.elements.get('translation-file').disabled, false);
+  assert.equal(plain.direction, 'mixed');
+  assert.equal(title.direction, 'rtl');
+  assert.match(app.elements.get('status').textContent, /mixed direction or alignment/);
+  assert.equal(app.elements.get('status').classList.contains('warning'), true);
+  assert.equal(app.elements.get('switch-ltr').hidden, false);
+  assert.equal(app.elements.get('switch-rtl').hidden, true);
 });
 
 test('Arabic application updates text direction and reports RTL styling without changing JSON', async () => {
@@ -1540,4 +1495,50 @@ test('durable RTL style recovery is available after reopening while text stays s
   assert.equal(layer.direction, 'ltr');
   assert.equal(layer.align, 'left');
   assert.match(reopened.elements.get('status').textContent, /Restored RTL styling/);
+});
+
+test('RTL text previously applied by language can still switch its LTR layout to RTL', async () => {
+  const { page, title, plain } = directionalPage('ltr');
+  const findShapes = page.findShapes.bind(page);
+  page.findShapes = criteria => findShapes(criteria).filter(shape => shape !== plain);
+  const app = await ui({ ar: { title: 'مرحبا' } }, { currentPage: page });
+  app.elements.get('language').value = 'ar';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([title.characters, title.direction, title.x], ['مرحبا', 'rtl', 20]);
+  assert.match(app.elements.get('direction-status').textContent, /Mixed/);
+  app.elements.get('switch-rtl').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([title.characters, title.direction, title.x], ['مرحبا', 'rtl', 150]);
+  assert.equal(app.elements.get('switch-ltr').hidden, false);
+});
+
+test('a layout confirmation failure reports partial success and can be recovered after reopening', async () => {
+  const { page, title } = directionalPage('ltr');
+  let rejectConfirmation = true;
+  const setPluginData = title.setPluginData;
+  title.setPluginData = (key, value) => {
+    if (rejectConfirmation && JSON.parse(value).layout?.active === 'baseline') {
+      rejectConfirmation = false;
+      throw new Error('SANITIZED final layout metadata failure');
+    }
+    setPluginData(key, value);
+  };
+  const app = await ui(undefined, { currentPage: page });
+  app.elements.get('switch-rtl').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  app.elements.get('switch-ltr').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual([title.direction, title.x, title.constraintsHorizontal], ['ltr', 20, 'left']);
+  assert.match(app.elements.get('status').textContent, /recovery metadata: 1/);
+  assert.equal(app.elements.get('status').classList.contains('warning'), true);
+  assert.equal(app.elements.get('switch-rtl').hidden, false);
+  assert.match(title.getPluginData('localization.rtl.v1'), /pending-baseline/);
+
+  const reopened = await ui(undefined, { currentPage: page });
+  reopened.elements.get('restore').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([title.direction, title.x, title.characters], ['ltr', 20, 'Original']);
+  assert.equal(reopened.elements.get('restore').disabled, true);
 });

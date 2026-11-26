@@ -9,6 +9,7 @@ penpot.ui.open("Penpot Localization", "index.html", { width: 360, height: 700 })
 const MAX_BYTES = 1024 * 1024;
 const STORAGE_PREFIX = "localization.saved-import.v1:";
 const RTL_METADATA_KEY = "localization.rtl.v1";
+const PAGE_DIRECTION_KEY = "localization.page-direction.v1";
 const RTL_BASE_LANGUAGES = new Set([
   "ar", "ckb", "dv", "fa", "he", "ps", "sd", "ug", "ur", "yi"
 ]);
@@ -35,6 +36,14 @@ const LAYOUT_FAILURE_REASONS = [
   "metadata", "padding", "position", "target"
 ];
 const recoveryJournal = new Map();
+
+function isDirection(value) {
+  return value === "ltr" || value === "rtl";
+}
+
+function oppositeDirection(direction) {
+  return direction === "rtl" ? "ltr" : "rtl";
+}
 
 function isRtlLanguage(language) {
   const subtags = language.toLowerCase().split("-");
@@ -88,10 +97,14 @@ function validManagedValue(field, value) {
 
 function validateMetadataSection(section, name) {
   if (!isPlainRecord(section)
-      || !["baseline", "rtl", "pending-baseline", "pending-rtl"].includes(section.active)
+      || !["baseline", "rtl", "ltr", "pending-baseline", "pending-rtl", "pending-ltr"].includes(section.active)
       || !isPlainRecord(section.baseline) || !isPlainRecord(section.rtlTarget)
       || !isPlainRecord(section.lastWritten)
-      || Object.keys(section).some(key => !["active", "baseline", "rtlTarget", "lastWritten"].includes(key))) {
+      || Object.keys(section).some(key => !["active", "baseline", "rtlTarget", "lastWritten",
+        ...(name === "layout" ? ["baselineDirection"] : ["ltrTarget"])].includes(key))
+      || (section.baselineDirection !== undefined && !isDirection(section.baselineDirection))
+      || (section.ltrTarget !== undefined && !isPlainRecord(section.ltrTarget))
+      || (["ltr", "pending-ltr"].includes(section.active) && !section.ltrTarget)) {
     throw new Error("Invalid RTL metadata.");
   }
   const allowed = name === "textStyle" ? ["align", "direction"] : [
@@ -102,7 +115,8 @@ function validateMetadataSection(section, name) {
   if (!baselineKeys.length || baselineKeys.some(key => !allowed.includes(key))) {
     throw new Error("Invalid RTL metadata.");
   }
-  for (const values of [section.baseline, section.rtlTarget, section.lastWritten]) {
+  for (const values of [section.baseline, section.rtlTarget, section.lastWritten,
+    ...(section.ltrTarget ? [section.ltrTarget] : [])]) {
     const keys = Object.keys(values).sort();
     if (!sameRecord(keys, baselineKeys)
         || keys.some(key => !validManagedValue(key, values[key]))) {
@@ -292,7 +306,9 @@ function captureContext(message) {
   }
   if (message.scope === "page" && message.pageId !== undefined
       && message.pageId !== currentPage.id) {
-    throw new Error("Page changed while reading translations. Review the scope and apply again.");
+    throw new Error(message.type === "switch-direction"
+      ? "Page changed. Review the scope and try again."
+      : "Page changed while reading translations. Review the scope and apply again.");
   }
   const pages = message.scope === "file" ? currentFile.pages : [currentPage];
   if (!Array.isArray(pages) || !pages.length) throw new Error("No pages are available.");
@@ -368,47 +384,30 @@ function removeRecovery(fileId, pageId, shapeId) {
   if (!fileJournal.size) recoveryJournal.delete(fileId);
 }
 
-function planManagedSection(shape, sectionName, current, rtlTarget, rtlActive) {
-  let metadata = readRtlMetadata(shape);
+function planManagedSection(shape, sectionName, current, rtlTarget, active, baselineDirection) {
+  const metadata = readRtlMetadata(shape);
   let section = metadata && metadata[sectionName];
-  if (section !== null && section !== undefined && (!section || typeof section !== "object"
-      || !["baseline", "rtl", "pending-baseline", "pending-rtl"].includes(section.active)
-      || !section.baseline || typeof section.baseline !== "object"
-      || !section.rtlTarget || typeof section.rtlTarget !== "object"
-      || !section.lastWritten || typeof section.lastWritten !== "object")) {
-    throw new Error("Invalid RTL metadata.");
-  }
-  if (!section) {
-    if (!rtlActive) return { operation: null, conflict: false };
-    section = {
-      active: "baseline",
-      baseline: current,
-      rtlTarget,
-      lastWritten: current
-    };
-  } else if (!sameRecord(current, section.baseline)
+  if (!section || !sameRecord(current, section.baseline)
       && !sameRecord(current, section.lastWritten)) {
-    const pendingTransition = section.active.startsWith("pending-")
+    if (!section && active === "baseline") return { operation: null, conflict: false };
+    const pendingTransition = section && section.active.startsWith("pending-")
       && Object.keys(section.baseline).every(key => current[key] === section.baseline[key]
-        || current[key] === section.rtlTarget[key]);
-    if (section.active === "rtl" || !pendingTransition && section.active !== "baseline") {
+        || current[key] === section.rtlTarget[key]
+        || (section.ltrTarget && current[key] === section.ltrTarget[key]));
+    if (section && section.active !== "baseline" && !pendingTransition) {
       return { operation: null, conflict: true };
     }
-    if (pendingTransition) {
-      // A previous metadata-first write may have been followed by only some setters.
-    } else {
-      section = {
-        active: "baseline",
-        baseline: current,
-        rtlTarget,
-        lastWritten: current
-      };
+    if (!pendingTransition) {
+      baselineDirection = section ? section.baselineDirection : baselineDirection;
+      section = { active: "baseline", baseline: current, rtlTarget, lastWritten: current };
+      if (baselineDirection) section.baselineDirection = baselineDirection;
     }
   }
+  // Layout records keep the original rtlTarget key for the mirrored geometry in either direction.
   let refreshedRtlTarget = section.rtlTarget;
-  if (sectionName === "layout" && sameRecord(current, section.baseline)) {
+  if (sectionName === "layout" && active === "rtl" && sameRecord(current, section.baseline)) {
     refreshedRtlTarget = rtlTarget;
-  } else if (sectionName === "layout" && section.active === "rtl"
+  } else if (sectionName === "layout" && active === "rtl" && section.active === "rtl"
       && sameRecord(current, section.lastWritten)
       && Object.prototype.hasOwnProperty.call(current, "x")
       && Object.prototype.hasOwnProperty.call(rtlTarget, "x")) {
@@ -417,16 +416,22 @@ function planManagedSection(shape, sectionName, current, rtlTarget, rtlActive) {
       x: rtlTarget.x + current.x - section.baseline.x
     };
   }
-  const target = rtlActive ? refreshedRtlTarget : section.baseline;
+  let ltrTarget = section.ltrTarget;
+  if (sectionName === "textStyle" && active === "ltr" && !ltrTarget) {
+    const { direction, align } = section.baseline;
+    ltrTarget = { direction: "ltr", align: direction === "rtl" ? swapHorizontal(align) : align };
+  }
+  const target = active === "rtl" ? refreshedRtlTarget
+    : active === "ltr" ? ltrTarget : section.baseline;
   const nextSection = {
-    active: rtlActive ? "rtl" : "baseline",
+    ...section,
+    ...(ltrTarget ? { ltrTarget } : {}),
+    active,
     baseline: section.baseline,
     rtlTarget: refreshedRtlTarget,
     lastWritten: target
   };
-  const metadataChanged = section.active !== nextSection.active
-    || !sameRecord(section.rtlTarget, nextSection.rtlTarget)
-    || !sameRecord(section.lastWritten, nextSection.lastWritten);
+  const metadataChanged = !sameRecord(section, nextSection);
   if (!metadataChanged && sameRecord(current, target)) {
     return { operation: null, conflict: false };
   }
@@ -444,8 +449,9 @@ function textStyleValues(layer) {
   return { direction: layer.direction, align: layer.align };
 }
 
-function rtlTextStyle(values) {
-  return { direction: "rtl", align: swapHorizontal(values.align) };
+function rtlTextStyle(values, explicit = false) {
+  return { direction: "rtl", align: explicit && values.direction === "rtl"
+    ? values.align : swapHorizontal(values.align) };
 }
 
 function addLayoutCandidate(candidates, pageId, shape, current, rtlTarget) {
@@ -598,17 +604,79 @@ function allPageShapes(page) {
   return shapes;
 }
 
-function inspectActiveRtlMetadata(context) {
+function readPageDirection(page) {
+  if (typeof page.getPluginData !== "function") return "";
+  const value = page.getPluginData(PAGE_DIRECTION_KEY);
+  if (value === null || value === undefined || value === "" || value === "auto") return "";
+  if (!isDirection(value)) throw new Error("Invalid saved page direction.");
+  return value;
+}
+
+function inferDirection(values) {
+  const directions = new Set(values);
+  if (directions.has("mixed") || directions.has("ltr") && directions.has("rtl")) return "mixed";
+  if (directions.size === 1) {
+    const [direction] = directions;
+    if (isDirection(direction)) return direction;
+  }
+  return "unknown";
+}
+
+function inferLayoutDirection(layers, shapes) {
+  const managedDirections = new Set();
+  for (const shape of shapes) {
+    const section = inspectRtlMetadata(shape).metadata?.layout;
+    if (section?.active === "rtl") {
+      managedDirections.add(oppositeDirection(section.baselineDirection || "ltr"));
+    }
+  }
+  if (managedDirections.size) return inferDirection(managedDirections);
+  return inferDirection(layers.map(layer => {
+    try {
+      const direction = layer.direction;
+      const previous = inspectRtlMetadata(layer).metadata?.textStyle;
+      // Language Apply can change the text on a page without mirroring its layout.
+      return previous?.active === "rtl" && direction === previous.lastWritten.direction
+        ? previous.baseline.direction : direction;
+    } catch (error) {
+      return "unknown";
+    }
+  }));
+}
+
+function inspectActiveRtlMetadata(context, includeDirection = false) {
   let restoreAvailable = false;
   let layoutMirrored = false;
   let complete = true;
+  const directions = [];
   for (const page of context.pages) {
     let shapes;
+    let remembered;
+    try {
+      remembered = readPageDirection(page.proxy);
+      if (remembered) restoreAvailable = true;
+    } catch (error) {
+      complete = false;
+    }
     try {
       shapes = allPageShapes(page.proxy);
     } catch (error) {
       complete = false;
+      directions.push(remembered || "unknown");
       continue;
+    }
+    if (includeDirection) {
+      let direction = remembered || "unknown";
+      if (remembered === "") {
+        try {
+          const layers = page.proxy.findShapes({ type: "text" });
+          const text = inferDirection(layers.map(layer => layer.direction));
+          direction = inferDirection([text, inferLayoutDirection(layers, shapes)]);
+        } catch (error) {
+          // Keep the direction unknown when the host cannot inspect the page.
+        }
+      }
+      directions.push(direction);
     }
     for (const shape of shapes) {
       const { metadata } = inspectRtlMetadata(shape);
@@ -623,21 +691,23 @@ function inspectActiveRtlMetadata(context) {
       }
     }
   }
-  return { restoreAvailable, layoutMirrored, complete };
+  return { restoreAvailable, layoutMirrored, complete, direction: inferDirection(directions) };
 }
 
 function handleRecoveryStatus(message) {
   const replyType = "recovery-status-result";
   try {
     const context = captureContext(message);
-    const state = inspectActiveRtlMetadata(context);
+    const state = inspectActiveRtlMetadata(context, true);
     penpot.ui.sendMessage({
       type: replyType,
       requestId: message.requestId,
       ok: true,
       restoreAvailable: hasRecovery(context.fileId) || state.restoreAvailable,
       layoutMirrored: state.layoutMirrored,
-      layoutStateComplete: state.complete
+      layoutStateComplete: state.complete,
+      direction: state.direction,
+      pageId: context.currentPageId
     });
   } catch (error) {
     sendOperationError(replyType,
@@ -646,67 +716,66 @@ function handleRecoveryStatus(message) {
   }
 }
 
-function planLayout(context, rtlActive, result) {
+function planLayout(page, direction, sourceDirection, result) {
   const candidates = new Map();
-  for (const page of context.pages) {
-    try {
-      if (rtlActive) {
-        const boards = page.proxy.findShapes({ type: "board" });
-        if (!Array.isArray(boards)) throw new Error("Invalid shape result.");
-        for (const board of boards) {
-          if (board && board.parent && page.proxy.root
-              && board.parent.id === page.proxy.root.id) {
-            collectMirroredLayout(page.id, board, candidates, result);
-          }
-        }
-      } else {
-        for (const shape of allPageShapes(page.proxy)) {
-          const inspected = inspectRtlMetadata(shape);
-          if (inspected.invalid) {
-            result.layoutConflicts += 1;
-            result.layoutMetadataConflicts += 1;
-            continue;
-          }
-          const metadata = inspected.metadata;
-          if (metadata && metadata.layout && metadata.layout.active !== "baseline") {
-            addLayoutCandidate(candidates, page.id, shape,
-              managedValues(shape, metadata.layout.lastWritten, "layout"),
-              metadata.layout.rtlTarget);
-          }
-        }
+  try {
+    const boards = page.proxy.findShapes({ type: "board" });
+    if (!Array.isArray(boards)) throw new Error("Invalid shape result.");
+    for (const board of boards) {
+      if (board && board.parent && page.proxy.root
+          && board.parent.id === page.proxy.root.id) {
+        collectMirroredLayout(page.id, board, candidates, result);
       }
-    } catch (error) {
-      recordPageFailure(result, page.id);
-      console.error("Cannot inspect page layout.");
     }
+  } catch (error) {
+    recordPageFailure(result, page.id);
+    console.error("Cannot inspect page layout.");
   }
   for (const candidate of candidates.values()) {
     try {
-      if (inspectRtlMetadata(candidate.shape).invalid) {
+      const { metadata, invalid } = inspectRtlMetadata(candidate.shape);
+      if (invalid) {
         result.layoutConflicts += 1;
         result.layoutMetadataConflicts += 1;
         continue;
       }
-      const planned = planManagedSection(candidate.shape, "layout", candidate.current,
-        candidate.rtlTarget, rtlActive);
+      const section = metadata?.layout;
+      const baselineDirection = section ? section.baselineDirection || "ltr" : sourceDirection;
+      const active = direction === baselineDirection ? "baseline" : "rtl";
+      const current = section && active === "baseline"
+        ? managedValues(candidate.shape, section.lastWritten, "layout") : candidate.current;
+      const planned = planManagedSection(candidate.shape, "layout", current,
+        candidate.rtlTarget, active, baselineDirection === "rtl" ? baselineDirection : undefined);
       if (planned.conflict) {
         result.layoutConflicts += 1;
       } else if (planned.operation) {
         result.layoutOperations.push({
-          pageId: candidate.pageId,
+          pageId: page.id,
           shapeId: candidate.shape.id,
           ...planned.operation
         });
       }
     } catch (error) {
       result.failed += 1;
-      console.error("Cannot plan RTL layout.");
+      console.error("Cannot plan directional layout.");
     }
   }
 }
 
-function planApply(context, strings, language, updateRtlLayout, mirrorRtlLayout) {
-  const rtl = isRtlLanguage(language);
+function planPageDirection(page, layers, direction, result) {
+  const previous = readPageDirection(page.proxy);
+  if (typeof page.proxy.getPluginData !== "function"
+      || typeof page.proxy.setPluginData !== "function") {
+    throw new Error("Page direction storage is unavailable.");
+  }
+  const inferred = previous || inferLayoutDirection(layers, allPageShapes(page.proxy));
+  const source = isDirection(inferred) ? inferred : oppositeDirection(direction);
+  if (previous !== direction) result.pageOperations.push({ pageId: page.id, previous, direction });
+  planLayout(page, direction, source, result);
+}
+
+function planApply(context, strings, language, direction = null) {
+  const rtl = direction ? direction === "rtl" : isRtlLanguage(language);
   const result = {
     pageCount: context.pages.length,
     rtl,
@@ -729,19 +798,36 @@ function planApply(context, strings, language, updateRtlLayout, mirrorRtlLayout)
     missing: new Set(),
     operations: [],
     styleOperations: [],
-    layoutOperations: []
+    layoutOperations: [],
+    pageOperations: []
   };
   for (const page of context.pages) {
     let textLayers;
+    let keepPageDirection;
     try {
       textLayers = page.proxy.findShapes({ type: "text" });
       if (!Array.isArray(textLayers)) throw new Error("Invalid shape result.");
+      if (direction) {
+        planPageDirection(page, textLayers, direction, result);
+      } else {
+        try {
+          keepPageDirection = Boolean(readPageDirection(page.proxy));
+        } catch (error) {
+          keepPageDirection = true;
+          result.styleConflicts += 1;
+          result.styleMetadataConflicts += 1;
+        }
+      }
     } catch (error) {
       recordPageFailure(result, page.id);
       console.error("Cannot inspect a page.");
       continue;
     }
     for (const layer of textLayers) {
+      if (direction) {
+        planTextDirection(page.id, layer, direction, result);
+        continue;
+      }
       let name;
       try {
         name = layer.name;
@@ -763,8 +849,8 @@ function planApply(context, strings, language, updateRtlLayout, mirrorRtlLayout)
         const after = strings[key];
         const inspected = inspectRtlMetadata(layer);
         const metadata = inspected.metadata;
-        const managesStyle = rtl || Boolean(metadata && metadata.textStyle
-          && metadata.textStyle.active !== "baseline");
+        const managesStyle = !keepPageDirection && (rtl || Boolean(metadata && metadata.textStyle
+          && metadata.textStyle.active !== "baseline"));
         if (!isValidId(layer.id)) {
           result.failed += 1;
         } else if ((before !== after || managesStyle) && hasMixedTextStyle(layer)) {
@@ -780,7 +866,7 @@ function planApply(context, strings, language, updateRtlLayout, mirrorRtlLayout)
           } else if (managesStyle) {
             const current = textStyleValues(layer);
             const planned = planManagedSection(layer, "textStyle", current,
-              rtlTextStyle(current), rtl);
+              rtlTextStyle(current), rtl ? "rtl" : "baseline");
             if (planned.conflict) result.styleConflicts += 1;
             else if (planned.operation) result.styleOperations.push({
               pageId: page.id, shapeId: layer.id, ...planned.operation
@@ -793,8 +879,36 @@ function planApply(context, strings, language, updateRtlLayout, mirrorRtlLayout)
       }
     }
   }
-  if (updateRtlLayout) planLayout(context, mirrorRtlLayout, result);
   return result;
+}
+
+function planTextDirection(pageId, layer, direction, result) {
+  try {
+    if (!isValidId(layer.id)) {
+      result.failed += 1;
+    } else if (layer.direction === "mixed" || layer.align === "mixed") {
+      result.skipped += 1;
+    } else {
+      const { metadata, invalid } = inspectRtlMetadata(layer);
+      if (invalid) {
+        result.styleConflicts += 1;
+        result.styleMetadataConflicts += 1;
+        return;
+      }
+      const current = textStyleValues(layer);
+      if (current.direction === direction
+          && (!metadata?.textStyle || metadata.textStyle.active === "baseline")) return;
+      const planned = planManagedSection(layer, "textStyle", current,
+        rtlTextStyle(current, true), direction);
+      if (planned.conflict) result.styleConflicts += 1;
+      else if (planned.operation) result.styleOperations.push({
+        pageId, shapeId: layer.id, ...planned.operation
+      });
+    }
+  } catch (error) {
+    recordManagedFailure(result, "style", "target");
+    console.error("Cannot plan text direction.");
+  }
 }
 
 function managedValues(shape, fields, kind) {
@@ -846,7 +960,7 @@ function executeManagedOperations(context, operations, kind, plan) {
       const sectionName = kind === "style" ? "textStyle" : "layout";
       const pendingMetadata = {
         ...operation.metadata,
-        active: operation.metadata.active === "rtl" ? "pending-rtl" : "pending-baseline"
+        active: `pending-${operation.metadata.active}`
       };
       try {
         writeRtlMetadata(shape, sectionName, pendingMetadata);
@@ -909,7 +1023,7 @@ function executeApply(context, plan) {
   let conflicts = 0;
   let historyFailed = false;
   const operationCount = plan.operations.length + plan.styleOperations.length
-    + plan.layoutOperations.length;
+    + plan.layoutOperations.length + plan.pageOperations.length;
   if (!operationCount) return { changed, styled, mirrored, conflicts, historyFailed };
   if (!contextStillMatches(context)) {
     plan.failed += operationCount;
@@ -954,8 +1068,26 @@ function executeApply(context, plan) {
         console.error("Cannot update a text layer.");
       }
     }
-    styled = executeManagedOperations(context, plan.styleOperations, "style", plan);
-    mirrored = executeManagedOperations(context, plan.layoutOperations, "layout", plan);
+    const rejectedPages = new Set();
+    for (const operation of plan.pageOperations) {
+      const page = pages.get(operation.pageId);
+      try {
+        if (readPageDirection(page) !== operation.previous) {
+          throw new Error("Page direction changed.");
+        }
+        page.setPluginData(PAGE_DIRECTION_KEY, operation.direction);
+        if (readPageDirection(page) !== operation.direction) {
+          throw new Error("Page direction readback failed.");
+        }
+      } catch (error) {
+        rejectedPages.add(operation.pageId);
+        recordPageFailure(plan, operation.pageId);
+      }
+    }
+    styled = executeManagedOperations(context,
+      plan.styleOperations.filter(operation => !rejectedPages.has(operation.pageId)), "style", plan);
+    mirrored = executeManagedOperations(context,
+      plan.layoutOperations.filter(operation => !rejectedPages.has(operation.pageId)), "layout", plan);
   } finally {
     try {
       penpot.history.undoBlockFinish(historyId);
@@ -968,23 +1100,23 @@ function executeApply(context, plan) {
 }
 
 function handleApply(message) {
-  const replyType = "localization-result";
+  const switching = message.type === "switch-direction";
+  const replyType = switching ? "direction-result" : "localization-result";
   try {
-    if (typeof message.updateRtlLayout !== "boolean"
-        || typeof message.mirrorRtlLayout !== "boolean") {
-      throw new Error("Invalid RTL layout preference.");
+    if (switching && (!isDirection(message.direction)
+        || message.scope === "page" && !isValidId(message.pageId))) {
+      throw new Error("Invalid direction or page context.");
     }
-    const strings = validateTranslations(message.translations, message.language);
+    const strings = switching ? null : validateTranslations(message.translations, message.language);
     const context = captureContext(message);
-    const plan = planApply(context, strings, message.language,
-      message.updateRtlLayout, message.mirrorRtlLayout);
+    const plan = planApply(context, strings, message.language, switching ? message.direction : null);
     const execution = executeApply(context, plan);
     const state = inspectActiveRtlMetadata(context);
     penpot.ui.sendMessage({
       type: replyType,
       requestId: message.requestId,
       ok: true,
-      language: message.language,
+      ...(switching ? { direction: message.direction } : { language: message.language }),
       rtl: plan.rtl,
       layoutMirrored: state.layoutMirrored,
       layoutStateComplete: state.complete,
@@ -1043,7 +1175,8 @@ function planRestore(context) {
     failedPageIds: new Set(),
     operations: [],
     styleOperations: [],
-    layoutOperations: []
+    layoutOperations: [],
+    pageOperations: []
   };
   if (fileJournal) {
     const journalPages = context.scope === "file"
@@ -1090,6 +1223,8 @@ function planRestore(context) {
     let shapes;
     try {
       shapes = allPageShapes(page.proxy);
+      const previous = readPageDirection(page.proxy);
+      if (previous) result.pageOperations.push({ pageId: page.id, previous });
     } catch (error) {
       recordPageFailure(result, page.id);
       continue;
@@ -1110,7 +1245,7 @@ function planRestore(context) {
           if (!section || section.active === "baseline") continue;
           const current = managedValues(shape, section.lastWritten, kind);
           const planned = planManagedSection(shape, sectionName, current,
-            section.rtlTarget, false);
+            section.rtlTarget, "baseline");
           if (planned.conflict) {
             if (kind === "style") result.styleConflicts += 1;
             else result.layoutConflicts += 1;
@@ -1133,7 +1268,7 @@ function executeRestore(context, plan) {
   let layoutsRestored = 0;
   let historyFailed = false;
   const operationCount = plan.operations.length + plan.styleOperations.length
-    + plan.layoutOperations.length;
+    + plan.layoutOperations.length + plan.pageOperations.length;
   if (!operationCount) return { restored, stylesRestored, layoutsRestored, historyFailed };
   if (!contextStillMatches(context)) {
     plan.failed += operationCount;
@@ -1179,6 +1314,21 @@ function executeRestore(context, plan) {
     }
     stylesRestored = executeManagedOperations(context, plan.styleOperations, "style", plan);
     layoutsRestored = executeManagedOperations(context, plan.layoutOperations, "layout", plan);
+    if (!plan.failedPages && !plan.styleConflicts && !plan.layoutConflicts
+        && !plan.metadataConflicts && !plan.failed) {
+      for (const operation of plan.pageOperations) {
+        const page = pages.get(operation.pageId);
+        try {
+          if (readPageDirection(page) !== operation.previous) {
+            throw new Error("Page direction changed.");
+          }
+          page.setPluginData(PAGE_DIRECTION_KEY, "auto");
+          if (readPageDirection(page)) throw new Error("Page direction readback failed.");
+        } catch (error) {
+          recordPageFailure(plan, operation.pageId);
+        }
+      }
+    }
   } finally {
     try {
       penpot.history.undoBlockFinish(historyId);
@@ -1242,7 +1392,7 @@ penpot.ui.onMessage((message) => {
   if (!message || !Number.isSafeInteger(message.requestId) || message.requestId < 1) return;
   if (message.type === "design-context-request") {
     handleDesignContext(message);
-  } else if (message.type === "apply-language") {
+  } else if (message.type === "apply-language" || message.type === "switch-direction") {
     handleApply(message);
   } else if (message.type === "restore-localization") {
     handleRestore(message);
@@ -1250,3 +1400,11 @@ penpot.ui.onMessage((message) => {
     handleRecoveryStatus(message);
   }
 });
+
+// The UI refreshes scope status without sending host proxies across the bridge.
+if (typeof penpot.on === "function") {
+  const refreshContext = () => penpot.ui.sendMessage({ type: "design-context-changed" });
+  penpot.on("pagechange", refreshContext);
+  penpot.on("filechange", refreshContext);
+  penpot.on("contentsave", refreshContext);
+}

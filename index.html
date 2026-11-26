@@ -21,9 +21,9 @@
     button { margin-top: 10px; cursor: pointer; }
     #apply { background: light-dark(#315bce, #9ab7ff); border-color: light-dark(#315bce, #9ab7ff); color: light-dark(#fff, #111a2e); font-weight: 600; }
     #restore { font-weight: 600; }
-    .check-control { display: flex; gap: 9px; align-items: flex-start; margin-top: 14px; }
-    .check-control input { margin: 2px 0 0; }
-    .check-control label { display: inline; margin: 0; }
+    .direction-actions { display: flex; gap: 8px; }
+    .direction-actions button { flex: 1; min-width: 0; }
+    #direction-status { margin-bottom: 0; }
     :focus-visible { outline: 2px solid light-dark(#315bce, #9ab7ff); outline-offset: 2px; }
     select:disabled, input:disabled, button:disabled { opacity: 0.55; cursor: default; }
     #status { margin-top: 16px; padding: 12px; border-radius: 6px; background: light-dark(#f3f5f8, #30343c); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; min-height: 54px; }
@@ -62,17 +62,17 @@
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
   </div>
   <small id="language-help">Changing language applies immediately. Reopening only restores your choices. Use the button to apply again, including to newly added text.</small>
-  <div class="check-control">
-    <input id="mirror-rtl-layout" type="checkbox" aria-describedby="rtl-help">
-    <label for="mirror-rtl-layout">Mirror RTL layout</label>
-  </div>
-  <small id="rtl-help">Language changes do not alter layout mirroring. Set this checkbox, then use Apply to mirror supported content or restore its baseline in scope. Grid and component layout subtrees are left unchanged.</small>
   <button id="apply" type="button" disabled>Apply to current page</button>
+  <small id="direction-status" role="status" aria-live="polite">Checking direction…</small>
+  <div class="direction-actions" role="group" aria-label="Text and layout direction">
+    <button id="switch-rtl" type="button" aria-describedby="direction-status" hidden disabled>Switch to RTL</button>
+    <button id="switch-ltr" type="button" aria-describedby="direction-status" hidden disabled>Switch to LTR</button>
+  </div>
   <button id="restore" type="button" aria-describedby="recovery-help" disabled>Restore current page</button>
   <small id="recovery-help">Restore returns session text and durable RTL style/layout changes to their baselines. External edits and missing layers are reported and left unchanged. Closing the plugin clears only text recovery.</small>
 
   <div id="status" role="status" aria-live="polite">Choose a translation JSON file to get started.</div>
-  <small>Rename text layers to translation keys, for example <code>i18n.login.title</code>. Untagged text is left unchanged. Layers with mixed per-character styles are skipped to preserve their formatting.</small>
+  <small>Rename text layers to translation keys, for example <code>i18n.login.title</code>. Direction applies to all eligible text and supported layout in scope. Translation applies only to tagged text.</small>
 
   <script>
     const languageSelect = document.getElementById("language");
@@ -85,7 +85,11 @@
     const applyButton = document.getElementById("apply");
     const restoreButton = document.getElementById("restore");
     const forgetButton = document.getElementById("forget");
-    const mirrorRtlLayout = document.getElementById("mirror-rtl-layout");
+    const directionStatus = document.getElementById("direction-status");
+    const directionButtons = {
+      rtl: document.getElementById("switch-rtl"),
+      ltr: document.getElementById("switch-ltr")
+    };
     const MAX_BYTES = 1024 * 1024;
     const languageNames = {
       AF: "Afrikaans",
@@ -159,6 +163,8 @@
     let recoveryRequestId = 0;
     let pendingRecovery = null;
     let restoreAvailable = false;
+    let directionContext = null;
+    let restoreDirectionFocus = null;
     let failedApply = null;
     let restoreApplyFocus = false;
     let restoreRestoreFocus = false;
@@ -243,9 +249,26 @@
       chooseFileButton.disabled = busy;
       languageSelect.disabled = busy || !translations;
       scopeSelect.disabled = busy;
-      mirrorRtlLayout.disabled = busy || !fileId;
+      const currentDirection = directionContext?.direction;
+      directionStatus.textContent = pendingRecovery ? "Checking direction…"
+        : currentDirection === "ltr" || currentDirection === "rtl"
+          ? `Direction: ${currentDirection.toUpperCase()}`
+          : currentDirection === "mixed" ? "Mixed direction. Choose a direction for text and layout."
+          : currentDirection === "unknown" ? "Unknown direction. Choose a direction for text and layout."
+          : "Direction is unavailable.";
+      for (const [direction, button] of Object.entries(directionButtons)) {
+        button.hidden = !directionContext || currentDirection === direction;
+        button.disabled = busy || Boolean(pendingRecovery) || button.hidden;
+      }
+      if (!busy && !pendingRecovery && restoreDirectionFocus) {
+        const button = directionButtons[restoreDirectionFocus];
+        const nextButton = button.hidden
+          ? Object.values(directionButtons).find(candidate => !candidate.hidden) : button;
+        if (nextButton) nextButton.focus();
+        restoreDirectionFocus = null;
+      }
       applyButton.disabled = busy || !hasSelection;
-      applyButton.textContent = pendingApply ? "Applying…" : needsRetry ? "Try again"
+      applyButton.textContent = pendingApply && !pendingApply.direction ? "Applying…" : needsRetry ? "Try again"
         : scopeSelect.value === "file" ? "Apply to all pages" : "Apply to current page";
       restoreButton.disabled = busy || !fileId || !restoreAvailable;
       restoreButton.textContent = pendingRestore ? "Restoring…"
@@ -403,7 +426,7 @@
         showStorageError(action, error.message);
       } finally {
         if (action !== "save") setLoading(false);
-        if (action === "load" && fileId && result.ok === true) {
+        if (action === "load" && fileId) {
           requestRecoveryStatus();
         }
       }
@@ -432,13 +455,13 @@
       pendingRecovery = null;
       if (request.scope === scopeSelect.value && result.ok === true
           && typeof result.restoreAvailable === "boolean"
-          && typeof result.layoutMirrored === "boolean"
-          && typeof result.layoutStateComplete === "boolean") {
+          && ["ltr", "rtl", "mixed", "unknown"].includes(result.direction)
+          && typeof result.pageId === "string"
+          && result.pageId.length > 0 && result.pageId.length <= 200) {
         restoreAvailable = result.restoreAvailable;
-        if (result.layoutStateComplete === true
-            && typeof result.layoutMirrored === "boolean") {
-          mirrorRtlLayout.checked = result.layoutMirrored;
-        }
+        directionContext = { direction: result.direction, pageId: result.pageId };
+      } else {
+        directionContext = null;
       }
       updateControls();
     }
@@ -480,51 +503,46 @@
       if (imported) applyLanguage(importContext && importContext.pageId);
     }
 
-    function applyLanguage(pageId = null, manualApply = false) {
+    function applyLanguage(pageId = null) {
       if (loading || pendingApply || pendingRestore
           || !translations || !languageSelect.value || !fileId) return;
+      sendApply({ type: "apply-language", language: languageSelect.value,
+        translations, ...(pageId ? { pageId } : {}) });
+    }
+
+    function switchDirection(direction) {
+      const button = directionButtons[direction];
+      if (button.disabled || !directionContext) return;
+      if (document.activeElement === button) restoreDirectionFocus = direction;
+      sendApply({ type: "switch-direction", direction,
+        ...(scopeSelect.value === "page" ? { pageId: directionContext.pageId } : {}) });
+    }
+
+    function sendApply(request) {
       pendingRecovery = null;
-      const retry = manualApply && matchesCurrentChoice(failedApply) ? failedApply : null;
-      pendingApply = {
-        requestId: ++applyRequestId, language: languageSelect.value,
-        scope: scopeSelect.value, translations, pageId,
-        updateRtlLayout: retry ? retry.updateRtlLayout : manualApply,
-        mirrorRtlLayout: retry ? retry.mirrorRtlLayout
-          : mirrorRtlLayout.checked
-      };
+      pendingApply = { ...request, requestId: ++applyRequestId, fileId, scope: scopeSelect.value };
       updateControls();
-      setStatus(`Applying ${languageSelect.value}…`);
-      let sent = false;
+      setStatus(request.direction ? `Switching text and layout to ${request.direction.toUpperCase()}…`
+        : `Applying ${request.language}…`);
       try {
-        parent.postMessage({
-          type: "apply-language",
-          requestId: pendingApply.requestId,
-          fileId,
-          language: pendingApply.language,
-          scope: pendingApply.scope,
-          updateRtlLayout: pendingApply.updateRtlLayout,
-          mirrorRtlLayout: pendingApply.mirrorRtlLayout,
-          translations: pendingApply.translations,
-          ...(pendingApply.pageId ? { pageId: pendingApply.pageId } : {})
-        }, "*");
-        sent = true;
+        parent.postMessage(pendingApply, "*");
       } catch (error) {
-        failedApply = pendingApply;
-        setStatus("Cannot send localization request. Try again.", true);
-      } finally {
-        if (!sent) {
-          pendingApply = null;
-          updateControls();
-        }
+        if (!request.direction) failedApply = pendingApply;
+        setStatus(request.direction ? "Cannot send direction request. Try again."
+          : "Cannot send localization request. Try again.", true);
+        pendingApply = null;
+        updateControls();
       }
     }
 
     function receiveLocalizationResult(result) {
       if (!pendingApply || result.requestId !== pendingApply.requestId) return;
+      const direction = pendingApply.direction;
+      if (result.type !== (direction ? "direction-result" : "localization-result")) return;
       try {
         if (typeof result.ok !== "boolean") throw new Error("Invalid localization result. Check the design before retrying.");
         if (!result.ok) {
-          failedApply = pendingApply;
+          if (!direction) failedApply = pendingApply;
           setStatus(typeof result.error === "string" ? result.error : "Localization failed.", true);
           return;
         }
@@ -549,7 +567,7 @@
           result.styleFailed,
           result.layoutFailed
         ];
-        if (result.language !== pendingApply.language
+        if ((direction ? result.direction !== direction : result.language !== pendingApply.language)
             || counts.some(count => !Number.isSafeInteger(count) || count < 0)
             || result.layoutUnsupported + result.layoutSubtreesSkipped !== result.layoutSkipped
             || result.styleMetadataConflicts > result.styleConflicts
@@ -565,14 +583,18 @@
           throw new Error("Invalid localization result. Check the design before retrying.");
         }
         restoreAvailable = result.restoreAvailable;
-        const parts = [
+        const parts = direction ? [
+          `${direction.toUpperCase()} requested across ${result.pageCount} page(s).`,
+          `${result.styled} text layer(s) and ${result.mirrored} layout shape(s) updated.`
+        ] : [
           `${result.language}: updated ${result.changed} text layer(s) across ${result.pageCount} page(s).`,
           `${result.alreadyCorrect} already matched; ${result.tagged} tagged layer(s) found.`
         ];
         if (result.missing.length) parts.push(`Missing translation keys: ${result.missing.join(", ")}`);
-        if (result.skipped) parts.push(`${result.skipped} mixed-style layer(s) skipped to preserve formatting.`);
-        if (result.styled) parts.push(`${result.styled} text layer(s) had RTL direction or alignment updated.`);
-        if (result.mirrored) parts.push(`${result.mirrored} layout shape(s) were mirrored or returned to their baseline.`);
+        if (result.skipped) parts.push(direction
+          ? `${result.skipped} layer(s) with mixed direction or alignment were skipped.`
+          : `${result.skipped} mixed-style layer(s) skipped to preserve formatting.`);
+        if (!direction && result.styled) parts.push(`${result.styled} text layer(s) had RTL direction or alignment updated.`);
         if (result.layoutSubtreesSkipped) parts.push(`${result.layoutSubtreesSkipped} component/grid layout subtree(s) were left unchanged.`);
         if (result.layoutUnsupported) parts.push(`${result.layoutUnsupported} unsupported layout target(s) were left unchanged.`);
         if (result.styleMetadataConflicts) parts.push(`${result.styleMetadataConflicts} unreadable RTL text-style metadata record(s) were left unchanged.`);
@@ -594,21 +616,14 @@
           || result.missing.length > 0 || result.styleConflicts > 0
           || result.layoutConflicts > 0 || result.styleFailed > 0
           || result.layoutFailed > 0;
-        if (blockingFailure) {
-          failedApply = pendingApply;
-        } else {
-          failedApply = null;
-          if (pendingApply.updateRtlLayout && result.layoutStateComplete) {
-            mirrorRtlLayout.checked = result.layoutMirrored;
-          }
-        }
+        if (!direction) failedApply = blockingFailure ? pendingApply : null;
         setStatus(parts.join("\n"), blockingFailure ? "error" : warning ? "warning" : "normal");
       } catch (error) {
-        failedApply = pendingApply;
+        if (!direction) failedApply = pendingApply;
         setStatus(error.message, true);
       } finally {
         pendingApply = null;
-        updateControls();
+        requestRecoveryStatus();
       }
     }
 
@@ -698,15 +713,12 @@
           || result.layoutFailed > 0;
         const blockingFailure = otherFailed > 0 || result.failedPages > 0
           || result.historyFailed;
-        if (!blockingFailure && result.layoutStateComplete) {
-          mirrorRtlLayout.checked = result.layoutMirrored;
-        }
         setStatus(parts.join("\n"), blockingFailure ? "error" : warning ? "warning" : "normal");
       } catch (error) {
         setStatus(error.message, true);
       } finally {
         pendingRestore = null;
-        updateControls();
+        requestRecoveryStatus();
       }
     }
 
@@ -721,20 +733,16 @@
     applyButton.addEventListener("click", () => {
       if (applyButton.disabled) return;
       restoreApplyFocus = document.activeElement === applyButton;
-      applyLanguage(null, true);
+      applyLanguage();
     });
     restoreButton.addEventListener("click", () => {
       if (restoreButton.disabled) return;
       restoreRestoreFocus = document.activeElement === restoreButton;
       restoreLocalization();
     });
-    mirrorRtlLayout.addEventListener("change", () => {
-      if (loading || pendingApply || pendingRestore || !fileId) return;
-      failedApply = null;
-      if (translations && languageSelect.value) {
-        setStatus("RTL layout option changed. Apply the selected language to update this scope.");
-      }
-    });
+    for (const [direction, button] of Object.entries(directionButtons)) {
+      button.addEventListener("click", () => switchDirection(direction));
+    }
     forgetButton.addEventListener("click", () => {
       if (loading || pendingApply || pendingRestore || !fileId) return;
       setLoading(true);
@@ -742,7 +750,7 @@
     });
     scopeSelect.addEventListener("change", () => {
       if (loading || pendingApply || pendingRestore) return;
-      updateControls();
+      directionContext = null;
       requestRecoveryStatus();
       if (!translations) return;
       if (!languageSelect.value) setStatus("Scope changed. Select a language to update the design.");
@@ -775,8 +783,12 @@
         receiveRestoreResult(result);
         return;
       }
-      if (!result || result.type !== "localization-result") return;
-      receiveLocalizationResult(result);
+      if (result?.type === "design-context-changed") {
+        directionContext = null;
+        requestRecoveryStatus();
+      } else if (result?.type === "localization-result" || result?.type === "direction-result") {
+        receiveLocalizationResult(result);
+      }
     });
 
     setLoading(true);

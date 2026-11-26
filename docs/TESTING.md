@@ -14,7 +14,7 @@ Run the Node suite for plugin/UI/message changes, the Python suite for server ch
 | Suite | Boundary and coverage |
 | --- | --- |
 | [Plugin](../tests/plugin.test.cjs) | Shipped script with mocked Penpot proxies/storage/history/plugin data: manifest/UI wiring, full request validation, context snapshots and stale-page rejection, matching, scope, plan-before-write ordering, repeated keys, idempotence, mixed-style skips, RTL language/script detection, smart alignment, layout reflection/reversal, grid/component skips, metadata failure/conflicts, traversal/setter/history failures, grouped apply/restore, readback, reopening recovery, sanitized logs, request IDs, saved-record limits, per-file storage isolation, and file-switch rejection. |
-| [UI](../tests/ui.test.cjs) | Shipped inline script and adapter together with DOM/Penpot/storage/history/plugin-data stubs and real Blob byte reads: startup/reopening, pre-read context capture, page/file navigation races, local imports, dynamic languages, invalid/canceled retention, limits/BOM/Unicode, malformed UTF-8 rejection, automatic/manual apply, RTL option persistence/reporting, durable style recovery, session text recovery, operation locks, source/text rendering, per-file save/forget, transport/storage failures, result validation, and stale/foreign/malformed replies. |
+| [UI](../tests/ui.test.cjs) | Shipped inline script and adapter together with DOM/Penpot/storage/history/plugin-data stubs and real Blob byte reads: startup/reopening, pre-read context capture, page/file navigation races, local imports, dynamic languages, invalid/canceled retention, limits/BOM/Unicode, malformed UTF-8 rejection, automatic/manual apply, direction switching, page direction persistence and reporting, durable style recovery, session text recovery, operation locks, source/text rendering, per-file save/forget, transport/storage failures, result validation, and stale/foreign/malformed replies. |
 | [Server](../tests/test_server.py) | Actual handler with in-memory HTTP connections: allowed assets, private/traversal/symlink rejection, query strings, HEAD, preflight, and headers. |
 
 GitHub Actions runs both commands on `ubuntu-latest` with Node.js 22 and Python 3.14, without installing project dependencies. The [test workflow](../.github/workflows/tests.yml) runs when a pull request is opened or receives new commits, and on pushes to `main`, including pull request merges. The local development server supports Python 3.9 and later. These tests do not establish browser policy, Penpot layout/style/font behavior, or undo/restore correctness.
@@ -31,7 +31,7 @@ These checks can help investigate a reported problem or document compatibility w
 | Page/file scopes | Each launch defaults to the current page, including saved imports; page mode isolates it; explicitly choosing file mode reaches non-active pages | Pending |
 | Missing/empty values | Missing keys preserve current text and warn; empty strings clear text | Pending |
 | Languages | English names for EN/ES/FR/ZH, Arabic, Portuguese, Hindi, lowercase and regional/script codes appear correctly; custom codes remain literal; Unicode translations render correctly | Pending |
-| RTL text/layout | Recognized base/script codes set text direction and smart alignment without automatic layout mutation; only manual Apply submits the checkbox to mirror/restore supported layout; the checkbox follows durable mirrored state across Apply, Restore, and reopening; mirroring keeps top-level boards fixed, handles plain/flex properties, skips grid/component layout, remains idempotent, survives reopening without storing text, and reports conflicts | Pending: mocked coverage added; real direction/layout/plugin-data behavior unverified |
+| RTL text/layout | Switch to either direction with or without translations, verify untagged and tagged text direction/alignment, unchanged strings, fixed top-level boards, plain/flex mirroring, grid/component layout skips, mixed and unknown choices, partial results, navigation, reopen and Restore. Check recognized RTL language styling on pages without a chosen direction. | Pending: mocked coverage added; real direction/layout/plugin-data behavior unverified |
 | Automatic/manual application | Language changes and valid reimports with the selected language apply once to the chosen scope; first imports and missing-language/rejected/canceled imports do not; prominent apply action stays visible after success and can translate newly added tagged text without reimporting or changing language | Pending |
 | Invalid/oversized imports | Reject malformed UTF-8, invalid JSON and oversized files without writes, retain last valid dictionary, render payload as text | Pending |
 | Styles | Supported font/size/color/alignment retained; unsupported mixed styles skipped | Pending: automated skip coverage added; real-host preservation/detection unverified |
@@ -47,6 +47,12 @@ These checks can help investigate a reported problem or document compatibility w
 Record each run's date, revision, `penpot.version`, browser/OS versions, sanitized fixture, observations, and unresolved issues. Keep private design text and dictionaries out of fixtures and screenshots.
 
 ## Validation record
+
+### LTR/RTL direction switching — 2026-11-26
+
+`node --check plugin.js`, `node --test tests/*.test.cjs` (105 mocked plugin/UI tests), `python3 -m unittest discover -s tests -p 'test_*.py' -v` (four in-memory HTTP checks), and `git diff --check` passed. The regression tests exercise both shipped endpoints and verify observable text direction, alignment, position, constraint, and recovery writes. They cover conversion without a dictionary, initially RTL pages, mixed and unknown scopes, untagged text, preservation of translated strings, page navigation and request rejection, reopening, rejected page metadata, partial layout confirmation, and Restore.
+
+Live Penpot rendering, page plugin-data persistence, event delivery, history and non-active page behavior, and remote CI are unverified for this change.
 
 ### GitHub Actions triggers — 2026-11-26
 
