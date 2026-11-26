@@ -8,18 +8,31 @@ const code = readFileSync(path.join(root, 'plugin.js'), 'utf8');
 let nextFixtureId = 0;
 const fixtureId = prefix => `${prefix}-${++nextFixtureId}`;
 const text = (name, characters = 'Original') => ({ id: fixtureId('shape'), name, characters });
+function withPluginData(shape) {
+  const data = new Map();
+  shape.getPluginData = key => data.get(key) || '';
+  shape.setPluginData = (key, value) => data.set(key, value);
+  return shape;
+}
+
+function rtlText(name = 'i18n.login.title', characters = 'Original', align = 'left') {
+  return withPluginData({ id: fixtureId('shape'), name, characters,
+    direction: 'ltr', align });
+}
 const page = (...layers) => {
   for (const layer of layers) {
     if (!layer.id) layer.id = fixtureId('shape');
   }
   return { id: fixtureId('page'), findShapes(criteria) {
-    assert.equal(criteria.type, 'text');
+    if (criteria?.type === 'board') return [];
+    if (criteria) assert.equal(criteria.type, 'text');
     return layers;
   }, getShapeById(id) { return layers.find(layer => layer.id === id) || null; } };
 };
 
 function preparePage(candidate) {
   if (!candidate.id) candidate.id = fixtureId('page');
+  if (!candidate.getPluginData) withPluginData(candidate);
   if (!candidate.getShapeById) {
     let knownLayers = [];
     const findShapes = candidate.findShapes.bind(candidate);
@@ -46,6 +59,7 @@ function runtime(pages = [page()], overrides = {}) {
   const history = [];
   const penpot = {
     currentPage: pages[0], currentFile: { id: 'file-a', pages },
+    async openPage(id) { this.currentPage = this.currentFile.pages.find(page => page.id === id); },
     history: {
       undoBlockBegin() { const id = Symbol('history'); history.push(['begin', id]); return id; },
       undoBlockFinish(id) { history.push(['finish', id]); }
@@ -54,14 +68,22 @@ function runtime(pages = [page()], overrides = {}) {
       sendMessage: msg => messages.push(JSON.parse(JSON.stringify(msg))) },
     ...overrides
   };
-  vm.runInNewContext(code, { penpot, TextEncoder, console: { error: (...args) => errors.push(args) } });
+  vm.runInNewContext(code, { penpot, TextEncoder, setTimeout, clearTimeout,
+    console: { error: (...args) => errors.push(args) } });
+  function request(message) {
+    const index = messages.length;
+    const pending = receive(message);
+    if (messages.length > index || !pending) return messages[index];
+    return pending.then(() => messages[index]);
+  }
   return { opened, messages, errors, history, penpot, send: receive, apply(extra = {}) {
-    receive({ type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page',
+    return request({ type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page',
       translations: { ES: { 'login.title': 'Hola' } }, ...extra });
-    return messages.at(-1);
+  }, switchDirection(direction, extra = {}) {
+    return request({ type: 'switch-direction', requestId: 1, fileId: 'file-a', scope: 'page',
+      pageId: penpot.currentPage.id, direction, ...extra });
   }, restore(extra = {}) {
-    receive({ type: 'restore-localization', requestId: 2, fileId: 'file-a', scope: 'page', ...extra });
-    return messages.at(-1);
+    return request({ type: 'restore-localization', requestId: 2, fileId: 'file-a', scope: 'page', ...extra });
   } };
 }
 
@@ -88,11 +110,11 @@ test('current-page scope changes only tagged keys and updates repeated keys', ()
   assert.equal(result.pageCount, 1);
 });
 
-test('file scope visits every page and repeated application is idempotent', () => {
+test('file scope visits every page and repeated application is idempotent', async () => {
   const a = text('i18n.login.title'), b = text('i18n.login.title');
   const app = runtime([page(a), page(b)]);
-  assert.equal(app.apply({ scope: 'file' }).changed, 2);
-  const second = app.apply({ scope: 'file' });
+  assert.equal((await app.apply({ scope: 'file' })).changed, 2);
+  const second = await app.apply({ scope: 'file' });
   assert.equal(second.changed, 0);
   assert.equal(second.alreadyCorrect, 2);
   assert.equal(second.pageCount, 2);
@@ -370,6 +392,31 @@ test('page traversal errors remain visible without concealing partial results', 
   assert.equal(result.failedPages, 1);
 });
 
+test('direction and Restore report unfiltered page traversal failures', () => {
+  const layer = rtlText();
+  const brokenPage = { id: 'baseline-traversal-page',
+    findShapes(criteria) {
+      if (criteria && criteria.type === 'text') return [layer];
+      throw new Error('Unavailable layout scan');
+    },
+    getShapeById(id) { return id === layer.id ? layer : null; } };
+  const app = runtime([brokenPage]);
+
+  const applied = app.apply({ language: 'EN',
+    translations: { EN: { 'login.title': 'Hello' } } });
+  assert.equal(applied.changed, 1);
+  assert.equal(applied.failedPages, 0);
+  assert.equal(layer.characters, 'Hello');
+  assert.equal(app.switchDirection('rtl').failedPages, 1);
+  assert.equal(layer.direction, 'ltr');
+
+  const restored = app.restore();
+  assert.equal(restored.restored, 1);
+  assert.equal(restored.failedPages, 1);
+  assert.equal(restored.restoreAvailable, true, 'the failed scan remains retryable');
+  assert.equal(layer.characters, 'Original');
+});
+
 test('failure logs exclude imported keys, design text and raw host exceptions', () => {
   const key = 'SANITIZED_KEY';
   const replacement = 'SANITIZED_REPLACEMENT';
@@ -555,7 +602,7 @@ test('design context snapshots expose only validated file and page IDs', () => {
   assert.equal(app.messages.at(-1).pageId, undefined);
 });
 
-test('page-scoped apply rejects a stale captured page while file scope remains stable', () => {
+test('page-scoped apply rejects a stale captured page while file scope remains stable', async () => {
   const firstLayer = text('i18n.login.title');
   const secondLayer = text('i18n.login.title');
   const firstPage = page(firstLayer);
@@ -569,7 +616,7 @@ test('page-scoped apply rejects a stale captured page while file scope remains s
   assert.equal(secondLayer.characters, 'Original');
   assert.equal(app.history.length, 0);
 
-  const applied = app.apply({ requestId: 2, scope: 'file', pageId: firstPage.id });
+  const applied = await app.apply({ requestId: 2, scope: 'file', pageId: firstPage.id });
   assert.equal(applied.changed, 2);
   assert.equal(firstLayer.characters, 'Hola');
   assert.equal(secondLayer.characters, 'Hola');
@@ -585,4 +632,673 @@ test('missing or malformed apply request IDs cause no writes or replies', () => 
   }
   assert.equal(writes, 0);
   assert.equal(app.messages.length, 0);
+});
+
+test('RTL language and script codes apply direction and smart alignment, then LTR restores it', () => {
+  for (const language of ['ar', 'AR-EG', 'ckb', 'dv', 'fa', 'he', 'ps', 'sd', 'ug', 'ur', 'yi',
+    'az-Arab', 'aa-Hebr', 'aa-Thaa', 'aa-Nkoo', 'aa-Adlm', 'aa-Rohg', 'aa-Syrc', 'aa-Mand']) {
+    const layer = rtlText();
+    const app = runtime([page(layer)]);
+    const result = app.apply({ language, translations: { [language]: { 'login.title': 'RTL' } } });
+    assert.equal(result.rtl, true, language);
+    assert.equal(result.styled, 1, language);
+    assert.equal(layer.direction, 'rtl', language);
+    assert.equal(layer.align, 'right', language);
+  }
+
+  const layer = rtlText('i18n.login.title', 'Original', 'center');
+  const app = runtime([page(layer)]);
+  app.apply({ language: 'ar', translations: { ar: { 'login.title': 'مرحبا' } } });
+  assert.equal(layer.align, 'center');
+  const repeated = app.apply({ requestId: 2, language: 'ar',
+    translations: { ar: { 'login.title': 'مرحبا' } } });
+  assert.equal(repeated.styled, 0);
+  const ltr = app.apply({ requestId: 3, language: 'EN',
+    translations: { EN: { 'login.title': 'Hello' } } });
+  assert.equal(ltr.rtl, false);
+  assert.equal(ltr.styled, 1);
+  assert.equal(layer.direction, 'ltr');
+  assert.equal(layer.align, 'center');
+});
+
+test('RTL style conflicts and mixed styles never overwrite external style changes', () => {
+  const layer = rtlText();
+  const app = runtime([page(layer)]);
+  app.apply({ language: 'ar', translations: { ar: { 'login.title': 'مرحبا' } } });
+  layer.align = 'center';
+  const conflict = app.apply({ requestId: 2, language: 'ar',
+    translations: { ar: { 'login.title': 'أهلا' } } });
+  assert.equal(conflict.changed, 1);
+  assert.equal(conflict.styleConflicts, 1);
+  assert.equal(layer.align, 'center');
+
+  const mixed = rtlText('i18n.login.title', 'مرحبا');
+  mixed.direction = 'mixed';
+  const skipped = runtime([page(mixed)]).apply({ language: 'ar',
+    translations: { ar: { 'login.title': 'مرحبا' } } });
+  assert.equal(skipped.skipped, 1);
+  assert.equal(skipped.styled, 0);
+});
+
+test('RTL metadata failures prevent style writes', () => {
+  let direction = 'ltr';
+  let styleWrites = 0;
+  const layer = { id: 'metadata-failure', name: 'i18n.login.title', characters: 'Original',
+    get direction() { return direction; },
+    set direction(value) { styleWrites++; direction = value; },
+    align: 'left', getPluginData: () => '',
+    setPluginData() { throw new Error('metadata unavailable'); } };
+  const result = runtime([page(layer)]).apply({ language: 'ar',
+    translations: { ar: { 'login.title': 'مرحبا' } } });
+  assert.equal(result.changed, 1);
+  assert.equal(result.styled, 0);
+  assert.equal(result.failed, 1);
+  assert.equal(styleWrites, 0);
+  assert.equal(direction, 'ltr');
+});
+
+test('metadata-first pending state safely retries a partial RTL style write', () => {
+  const data = new Map();
+  let direction = 'ltr';
+  let align = 'left';
+  let failAlign = true;
+  const layer = { id: 'partial-style', name: 'i18n.login.title', characters: 'Original',
+    get direction() { return direction; }, set direction(value) { direction = value; },
+    get align() { return align; }, set align(value) {
+      if (failAlign) throw new Error('alignment unavailable');
+      align = value;
+    },
+    getPluginData: key => data.get(key) || '',
+    setPluginData: (key, value) => data.set(key, value) };
+  const app = runtime([page(layer)]);
+  const partial = app.apply({ language: 'ar',
+    translations: { ar: { 'login.title': 'مرحبا' } } });
+  assert.equal(partial.failed, 1);
+  assert.equal(direction, 'rtl');
+  assert.equal(align, 'left');
+  assert.match(data.get('localization.rtl.v1'), /pending-rtl/);
+
+  failAlign = false;
+  const retried = app.apply({ requestId: 2, language: 'ar',
+    translations: { ar: { 'login.title': 'مرحبا' } } });
+  assert.equal(retried.styleConflicts, 0);
+  assert.equal(retried.styled, 1);
+  assert.equal(align, 'right');
+  assert.doesNotMatch(data.get('localization.rtl.v1'), /pending-/);
+});
+
+test('unsupported optional flex values are skipped instead of written', () => {
+  let paddingWrites = 0;
+  const rootShape = { id: 'root' };
+  const flex = { dir: 'column', alignItems: undefined,
+    get leftPadding() { return undefined; },
+    set leftPadding(value) { paddingWrites++; throw new Error(`invalid ${value}`); },
+    get rightPadding() { return undefined; },
+    set rightPadding(value) { paddingWrites++; throw new Error(`invalid ${value}`); } };
+  const board = withPluginData({ id: 'optional-flex', x: 0, width: 100,
+    parent: rootShape, children: [], flex, isComponentInstance: () => false });
+  const layoutPage = { id: 'optional-flex-page', root: rootShape,
+    findShapes(criteria) {
+      if (!criteria) return [board];
+      if (criteria.type === 'text') return [];
+      if (criteria.type === 'board') return [board];
+      return [];
+    },
+    getShapeById(id) { return id === board.id ? board : null; } };
+
+  const app = runtime([layoutPage]);
+  const result = app.switchDirection('rtl');
+
+  assert.equal(result.failed, 0);
+  assert.equal(result.mirrored, 0);
+  assert.equal(result.layoutSkipped, 1);
+  assert.equal(result.layoutUnsupported, 1);
+  assert.equal(result.layoutSubtreesSkipped, 0);
+  assert.equal(paddingWrites, 0);
+  assert.equal(app.errors.length, 0);
+});
+
+test('unsupported flex fields are reported alongside supported updates', () => {
+  const rootShape = { id: 'root' };
+  const flex = { dir: 'row', alignItems: 'start', leftPadding: undefined,
+    rightPadding: undefined };
+  const board = withPluginData({ id: 'partial-flex', x: 0, width: 100,
+    parent: rootShape, children: [], flex, isComponentInstance: () => false });
+  const layoutPage = { id: 'partial-flex-page', root: rootShape,
+    findShapes(criteria) {
+      if (!criteria) return [board];
+      if (criteria.type === 'text') return [];
+      if (criteria.type === 'board') return [board];
+      return [];
+    },
+    getShapeById(id) { return id === board.id ? board : null; } };
+
+  const result = runtime([layoutPage]).switchDirection('rtl');
+
+  assert.equal(result.mirrored, 1);
+  assert.equal(flex.dir, 'row-reverse');
+  assert.equal(result.layoutSkipped, 1);
+  assert.equal(result.layoutUnsupported, 1);
+});
+
+test('one rejected layout property does not block supported properties on the same shape', () => {
+  const data = new Map();
+  let dir = 'row';
+  let leftPadding = 4;
+  let rightPadding = 12;
+  const flex = {
+    get dir() { return dir; },
+    set dir(value) { throw new Error(`unsupported ${value}`); },
+    get leftPadding() { return leftPadding; },
+    set leftPadding(value) { leftPadding = value; },
+    get rightPadding() { return rightPadding; },
+    set rightPadding(value) { rightPadding = value; }
+  };
+  const rootShape = { id: 'root' };
+  const board = { id: 'partial-layout', x: 0, width: 100, parent: rootShape,
+    children: [], flex, isComponentInstance: () => false,
+    getPluginData: key => data.get(key) || '',
+    setPluginData: (key, value) => data.set(key, value) };
+  const layoutPage = { id: 'partial-layout-page', root: rootShape,
+    findShapes(criteria) {
+      if (!criteria) return [board];
+      if (criteria.type === 'text') return [];
+      if (criteria.type === 'board') return [board];
+      return [];
+    },
+    getShapeById(id) { return id === board.id ? board : null; } };
+
+  const app = runtime([layoutPage]);
+  const result = app.switchDirection('rtl');
+
+  assert.equal(result.failed, 1);
+  assert.equal(result.layoutFailed, 1);
+  assert.equal(result.styleFailed, 0);
+  assert.deepEqual(result.layoutFailureReasons, {
+    alignment: 0, constraints: 0, flexDirection: 1, margins: 0,
+    metadata: 0, padding: 0, position: 0, target: 0
+  });
+  assert.equal(result.mirrored, 1);
+  assert.equal(result.layoutStateComplete, false);
+  assert.equal(dir, 'row');
+  assert.equal(leftPadding, 12);
+  assert.equal(rightPadding, 4);
+  assert.match(data.get('localization.rtl.v1'), /pending-rtl/);
+  assert.deepEqual(app.errors,
+    [['Some RTL layout updates were skipped (flexDirection: 1).']]);
+});
+
+test('invalid or unreadable RTL metadata does not block text updates or spam recovery scans', () => {
+  const layer = rtlText();
+  layer.getPluginData = () => '{invalid';
+  const unreadable = rtlText();
+  unreadable.getPluginData = () => { throw new Error('metadata unavailable'); };
+  const app = runtime([page(layer, unreadable)]);
+
+  const result = app.apply({ language: 'ar',
+    translations: { ar: { 'login.title': 'مرحبا' } } });
+  assert.equal(result.changed, 2);
+  assert.equal(result.styled, 0);
+  assert.equal(result.styleConflicts, 2);
+  assert.equal(result.styleMetadataConflicts, 2);
+  assert.equal(layer.characters, 'مرحبا');
+  assert.equal(unreadable.characters, 'مرحبا');
+
+  app.send({ type: 'recovery-status-request', requestId: 9,
+    fileId: 'file-a', scope: 'page' });
+  assert.equal(app.messages.at(-1).ok, true);
+  assert.equal(app.messages.at(-1).restoreAvailable, true,
+    'session text recovery remains available');
+
+  const restored = app.restore({ requestId: 10 });
+  assert.equal(restored.restored, 2);
+  assert.equal(restored.metadataConflicts, 2);
+  assert.equal(restored.failed, 0);
+  assert.equal(app.errors.length, 0);
+});
+
+test('managed RTL layout mirrors supported board contents and reverses idempotently', () => {
+  const rootShape = { id: 'root' };
+  const marginChild = withPluginData({ id: 'margin-child', x: 0, width: 20,
+    constraintsHorizontal: 'left', layoutChild: { absolute: false, marginType: 'multiple',
+      leftMargin: 4, rightMargin: 12, alignSelf: 'start' }, children: [], flipX: false,
+    isComponentInstance: () => false });
+  const flexBoard = withPluginData({ id: 'flex-board', x: 120, width: 100,
+    constraintsHorizontal: 'right', parent: null, children: [marginChild],
+    flex: { dir: 'column', alignItems: 'start', leftPadding: 8, rightPadding: 16 },
+    isComponentInstance: () => false });
+  marginChild.parent = flexBoard;
+  const plainChild = withPluginData({ id: 'plain-child', x: 240, width: 40,
+    constraintsHorizontal: 'left', children: [], flipX: false,
+    isComponentInstance: () => false });
+  const grid = withPluginData({ id: 'grid', x: 0, width: 20, constraintsHorizontal: 'left',
+    grid: { dir: 'row' }, children: [], isComponentInstance: () => false });
+  const component = withPluginData({ id: 'component', x: 0, width: 20,
+    constraintsHorizontal: 'left', children: [], isComponentInstance: () => true });
+  const board = withPluginData({ id: 'board', x: 100, width: 300, parent: rootShape,
+    children: [flexBoard, plainChild, grid, component], isComponentInstance: () => false });
+  flexBoard.parent = board;
+  plainChild.parent = board;
+  grid.parent = board;
+  component.parent = board;
+  const label = rtlText('i18n.login.title');
+  label.parent = board;
+  const shapes = [board, flexBoard, marginChild, plainChild, grid, component, label];
+  const layoutPage = {
+    id: 'layout-page', root: rootShape,
+    findShapes(criteria) {
+      if (!criteria) return shapes;
+      if (criteria.type === 'text') return [label];
+      if (criteria.type === 'board') return [board, flexBoard, grid];
+      return [];
+    },
+    getShapeById(id) { return shapes.find(shape => shape.id === id) || null; }
+  };
+  const app = runtime([layoutPage]);
+  const rtl = app.switchDirection('rtl');
+  assert.equal(rtl.layoutSkipped, 2);
+  assert.equal(rtl.layoutSubtreesSkipped, 2);
+  assert.equal(rtl.layoutUnsupported, 0);
+  assert.ok(rtl.mirrored >= 3);
+  assert.equal(board.x, 100, 'the top-level board stays fixed');
+  assert.equal(flexBoard.x, 280);
+  assert.equal(flexBoard.constraintsHorizontal, 'left');
+  assert.equal(flexBoard.flex.dir, 'column');
+  assert.equal(flexBoard.flex.alignItems, 'end');
+  assert.equal(flexBoard.flex.leftPadding, 16);
+  assert.equal(flexBoard.flex.rightPadding, 8);
+  assert.equal(marginChild.layoutChild.leftMargin, 12);
+  assert.equal(marginChild.layoutChild.rightMargin, 4);
+  assert.equal(marginChild.layoutChild.alignSelf, 'end');
+  assert.equal(plainChild.x, 220);
+  assert.equal(plainChild.flipX, false);
+  assert.equal(grid.x, 0);
+  assert.equal(component.x, 0);
+
+  const repeated = app.switchDirection('rtl', { requestId: 2 });
+  assert.equal(repeated.mirrored, 0);
+  const reversed = app.switchDirection('ltr', { requestId: 3 });
+  assert.ok(reversed.mirrored >= 3);
+  assert.equal(flexBoard.x, 120);
+  assert.equal(flexBoard.flex.alignItems, 'start');
+  assert.equal(plainChild.x, 240);
+  assert.equal(label.direction, 'ltr');
+  assert.equal(label.characters, 'Original');
+});
+
+test('reapplying mirrored layout refreshes targets after baseline geometry changes', () => {
+  const rootShape = { id: 'root' };
+  const child = withPluginData({ id: 'resized-child', x: 20, width: 30,
+    constraintsHorizontal: 'left', children: [], isComponentInstance: () => false });
+  const board = withPluginData({ id: 'resized-board', x: 0, width: 200,
+    parent: rootShape, children: [child], isComponentInstance: () => false });
+  child.parent = board;
+  const shapes = [board, child];
+  const layoutPage = { id: 'resized-page', root: rootShape,
+    findShapes(criteria) {
+      if (!criteria) return shapes;
+      if (criteria.type === 'text') return [];
+      if (criteria.type === 'board') return [board];
+      return [];
+    },
+    getShapeById(id) { return shapes.find(shape => shape.id === id) || null; } };
+  const app = runtime([layoutPage]);
+
+  app.switchDirection('rtl');
+  app.switchDirection('ltr', { requestId: 2 });
+  child.width = 50;
+  board.width = 300;
+  const reapplied = app.switchDirection('rtl', { requestId: 3 });
+
+  assert.equal(reapplied.layoutConflicts, 0);
+  assert.equal(child.x, 230);
+});
+
+test('reapplying mirrored layout refreshes targets after mirrored geometry changes', () => {
+  const rootShape = { id: 'root' };
+  const child = withPluginData({ id: 'mirrored-resized-child', x: 20, width: 30,
+    constraintsHorizontal: 'left', children: [], isComponentInstance: () => false });
+  const board = withPluginData({ id: 'mirrored-resized-board', x: 0, width: 200,
+    parent: rootShape, children: [child], isComponentInstance: () => false });
+  child.parent = board;
+  const shapes = [board, child];
+  const layoutPage = { id: 'mirrored-resized-page', root: rootShape,
+    findShapes(criteria) {
+      if (!criteria) return shapes;
+      if (criteria.type === 'text') return [];
+      if (criteria.type === 'board') return [board];
+      return [];
+    },
+    getShapeById(id) { return shapes.find(shape => shape.id === id) || null; } };
+  const app = runtime([layoutPage]);
+
+  app.switchDirection('rtl');
+  board.width = 300;
+  child.width = 50;
+  const reapplied = app.switchDirection('rtl', { requestId: 2 });
+
+  assert.equal(reapplied.layoutConflicts, 0);
+  assert.equal(child.x, 230);
+});
+
+test('durable RTL metadata is discoverable after reopening and Restore returns baselines', () => {
+  const layer = rtlText();
+  const first = runtime([page(layer)]);
+  first.apply({ language: 'ar', translations: { ar: { 'login.title': 'مرحبا' } } });
+  const reopened = runtime([page(layer)]);
+  reopened.send({ type: 'recovery-status-request', requestId: 9,
+    fileId: 'file-a', scope: 'page' });
+  assert.equal(reopened.messages.at(-1).restoreAvailable, true);
+  const restored = reopened.restore();
+  assert.equal(restored.stylesRestored, 1);
+  assert.equal(restored.restored, 0, 'text recovery remains session-only');
+  assert.equal(layer.characters, 'مرحبا');
+  assert.equal(layer.direction, 'ltr');
+  assert.equal(layer.align, 'left');
+});
+
+test('externally changed mirrored geometry is reported and never overwritten', () => {
+  const rootShape = { id: 'root' };
+  const child = withPluginData({ id: 'child', x: 20, width: 30,
+    constraintsHorizontal: 'left', children: [], isComponentInstance: () => false });
+  const board = withPluginData({ id: 'board', x: 0, width: 200, parent: rootShape,
+    children: [child], isComponentInstance: () => false });
+  child.parent = board;
+  const layoutPage = { id: 'layout-conflict-page', root: rootShape,
+    findShapes(criteria) {
+      if (!criteria) return [board, child];
+      if (criteria.type === 'text') return [];
+      if (criteria.type === 'board') return [board];
+      return [];
+    },
+    getShapeById(id) { return [board, child].find(shape => shape.id === id) || null; } };
+  const app = runtime([layoutPage]);
+  app.switchDirection('rtl');
+  assert.equal(child.x, 150);
+  child.x = 140;
+  const result = app.switchDirection('ltr', { requestId: 2 });
+  assert.equal(result.layoutConflicts, 1);
+  assert.equal(child.x, 140);
+});
+
+test('direction rejects stale, malformed and cross-file requests without writes', () => {
+  const layer = rtlText();
+  const current = page(layer);
+  const other = page(rtlText());
+  const app = runtime([current, other]);
+  for (const request of [{ direction: 'mixed' }, { pageId: undefined }, { pageId: other.id },
+    { fileId: 'another-file' }, { scope: 'selection' }]) {
+    assert.equal(app.switchDirection('rtl', request).ok, false);
+    assert.equal(layer.direction, 'ltr');
+    assert.equal(layer.getPluginData('localization.rtl.v1'), '');
+    assert.equal(current.getPluginData('localization.page-direction.v1'), '');
+  }
+  const replyCount = app.messages.length;
+  app.switchDirection('rtl', { requestId: 0 });
+  assert.equal(app.messages.length, replyCount);
+  assert.deepEqual(app.history, []);
+});
+
+test('rejected page metadata prevents direction setters while other pages can switch', async () => {
+  const layer = rtlText();
+  const sibling = rtlText();
+  const broken = withPluginData(page(layer));
+  broken.setPluginData = () => { throw new Error('Page metadata rejected'); };
+  const safe = page(sibling);
+  const app = runtime([broken, safe]);
+  const result = await app.switchDirection('rtl', { scope: 'file' });
+  assert.equal(result.failedPages, 1);
+  assert.equal(result.styled, 1);
+  assert.equal(layer.direction, 'ltr');
+  assert.equal(layer.getPluginData('localization.rtl.v1'), '');
+  assert.equal(sibling.direction, 'rtl');
+  assert.equal(safe.getPluginData('localization.page-direction.v1'), 'rtl');
+  assert.deepEqual(app.history.map(([event]) => event), ['begin', 'finish', 'begin', 'finish']);
+});
+
+test('Restore after reopening returns a native RTL page to baseline and clears its chosen direction', () => {
+  const layer = rtlText('Untagged', 'Original', 'right');
+  layer.direction = 'rtl';
+  const current = page(layer);
+  const app = runtime([current]);
+  assert.equal(app.switchDirection('ltr').styled, 1);
+  assert.deepEqual([layer.direction, layer.align], ['ltr', 'left']);
+  const reopened = runtime([current]);
+  assert.equal(reopened.restore().stylesRestored, 1);
+  assert.deepEqual([layer.direction, layer.align, layer.characters], ['rtl', 'right', 'Original']);
+  assert.equal(current.getPluginData('localization.page-direction.v1'), 'auto');
+  reopened.send({ type: 'recovery-status-request', requestId: 3, fileId: 'file-a', scope: 'page' });
+  assert.equal(reopened.messages.at(-1).direction, 'rtl');
+  assert.equal(reopened.messages.at(-1).restoreAvailable, false);
+});
+
+test('an unset direction stays recoverable while the tagged text still translates', () => {
+  const layer = rtlText();
+  layer.direction = null;
+  let directionWrites = 0;
+  Object.defineProperty(layer, 'direction', {
+    get() { return null; },
+    set() { directionWrites++; }
+  });
+  const app = runtime([page(layer)]);
+  const switched = app.switchDirection('rtl');
+  assert.equal(switched.styleUnsupported, 1);
+  assert.equal(switched.styled, 0);
+  app.restore();
+  const applied = app.apply({ language: 'ar', translations: { ar: { 'login.title': 'مرحبا' } } });
+  assert.equal(applied.changed, 1);
+  assert.equal(applied.styleUnsupported, 1);
+  assert.equal(directionWrites, 0);
+  assert.equal(layer.getPluginData('localization.rtl.v1'), '');
+  assert.equal(app.restore().restored, 1);
+  assert.equal(layer.characters, 'Original');
+});
+
+test('silently rejected shape metadata prevents writes or leaves confirmed recovery pending', () => {
+  const initialRejected = rtlText();
+  initialRejected.setPluginData = () => {};
+  const finalRejected = rtlText();
+  const setData = finalRejected.setPluginData;
+  finalRejected.setPluginData = (key, value) => {
+    if (JSON.parse(value).textStyle.active !== 'rtl') setData(key, value);
+  };
+  const current = page(initialRejected, finalRejected);
+  const app = runtime([current]);
+  const result = app.switchDirection('rtl');
+  assert.equal(result.styleFailed, 2);
+  assert.equal(result.styled, 1);
+  assert.equal(result.layoutStateComplete, false);
+  assert.deepEqual([initialRejected.direction, initialRejected.align], ['ltr', 'left']);
+  assert.equal(initialRejected.getPluginData('localization.rtl.v1'), '');
+  assert.deepEqual([finalRejected.direction, finalRejected.align], ['rtl', 'right']);
+  assert.match(finalRejected.getPluginData('localization.rtl.v1'), /pending-rtl/);
+  assert.equal(app.restore().stylesRestored, 1);
+  assert.deepEqual([finalRejected.direction, finalRejected.align], ['ltr', 'left']);
+});
+
+function boardPage(board, ...descendants) {
+  const root = { id: fixtureId('root'), x: 0 };
+  board.parent = root;
+  const shapes = [board, ...descendants];
+  return { root, findShapes(criteria) {
+    if (!criteria) return shapes;
+    return criteria.type === 'board' ? [board] : descendants.filter(shape => shape.name);
+  }, getShapeById(id) { return shapes.find(shape => shape.id === id) || null; } };
+}
+
+test('nested reflection uses parent-relative positions for both direction reversal and Restore', () => {
+  const child = withPluginData({ id: fixtureId('child'), x: 30, width: 10,
+    constraintsHorizontal: 'left' });
+  let innerX = 20;
+  const inner = withPluginData({ id: fixtureId('board'), width: 80, children: [child],
+    constraintsHorizontal: 'left', get x() { return innerX; },
+    set x(value) { child.x += value - innerX; innerX = value; } });
+  const outer = withPluginData({ id: fixtureId('board'), x: 0, width: 200, children: [inner] });
+  inner.parent = outer;
+  child.parent = inner;
+  const current = boardPage(outer, inner, child);
+  const app = runtime([current]);
+  const rtl = app.switchDirection('rtl');
+  assert.equal(rtl.layoutConflicts, 0);
+  assert.deepEqual([outer.x, inner.x, child.x], [0, 100, 160]);
+  assert.equal(app.switchDirection('ltr').layoutConflicts, 0);
+  assert.deepEqual([outer.x, inner.x, child.x], [0, 20, 30]);
+  app.switchDirection('rtl');
+  const reopened = runtime([current]);
+  const restored = reopened.restore();
+  assert.equal(restored.layoutsRestored, 2);
+  assert.equal(restored.layoutConflicts, 0);
+  assert.deepEqual([outer.x, inner.x, child.x], [0, 20, 30]);
+});
+
+test('reversing a partial margin swap recovers asymmetry even when the current values match', () => {
+  let rightMargin = 15;
+  let rejectRight = true;
+  const margins = { absolute: false, marginType: 'multiple', leftMargin: 5,
+    get rightMargin() { return rightMargin; },
+    set rightMargin(value) {
+      if (rejectRight) throw new Error('rejected margin');
+      rightMargin = value;
+    } };
+  const child = withPluginData({ id: fixtureId('child'), layoutChild: margins });
+  const board = withPluginData({ id: fixtureId('board'), x: 0, width: 200,
+    flex: { dir: 'row', leftPadding: 0, rightPadding: 0 }, children: [child] });
+  child.parent = board;
+  const app = runtime([boardPage(board, child)]);
+  assert.equal(app.switchDirection('rtl').layoutFailed, 1);
+  assert.deepEqual([margins.leftMargin, margins.rightMargin], [15, 15]);
+  rejectRight = false;
+  const reversed = app.switchDirection('ltr');
+  assert.equal(reversed.layoutFailed, 0);
+  assert.equal(reversed.layoutConflicts, 0);
+  assert.deepEqual([margins.leftMargin, margins.rightMargin], [5, 15]);
+});
+
+test('retry or reversal of an incomplete page switch preserves the source layout for untouched shapes', () => {
+  for (const direction of ['ltr', 'rtl']) {
+    const child = withPluginData({ id: fixtureId('child'), x: 20, width: 30,
+      constraintsHorizontal: 'left' });
+    const setData = child.setPluginData;
+    child.setPluginData = () => {};
+    const label = rtlText();
+    const board = withPluginData({ id: fixtureId('board'), x: 0, width: 200, children: [child] });
+    child.parent = board;
+    const current = boardPage(board, child, label);
+    const app = runtime([current]);
+    assert.equal(app.switchDirection('rtl').layoutFailed, 1);
+    assert.equal(child.x, 20);
+    assert.equal(current.getPluginData('localization.page-direction.v1'), 'pending:ltr:rtl');
+
+    child.setPluginData = setData;
+    const reopened = runtime([current]);
+    const next = reopened.switchDirection(direction);
+    assert.equal(next.layoutStateComplete, true);
+    assert.equal(child.x, direction === 'rtl' ? 150 : 20);
+    assert.equal(label.direction, direction);
+    assert.equal(current.getPluginData('localization.page-direction.v1'), direction);
+  }
+});
+
+test('file scope activates targets before writing and clears only successfully restored page directions', async () => {
+  const layers = [rtlText(), rtlText(), rtlText()];
+  const pages = layers.map(layer => page(layer));
+  const activeId = () => app.penpot.currentPage?.id;
+  const navigated = [];
+  const app = runtime(pages, { async openPage(id) {
+    navigated.push(id);
+    if (id === pages[2].id) throw new Error('page unavailable');
+    this.currentPage = pages.find(page => page.id === id);
+  } });
+  for (const [index, layer] of layers.entries()) {
+    let direction = layer.direction;
+    Object.defineProperty(layer, 'direction', {
+      get() { return direction; },
+      set(value) {
+        assert.equal(activeId(), pages[index].id);
+        direction = value;
+      }
+    });
+  }
+
+  const switched = await app.switchDirection('rtl', { scope: 'file' });
+  assert.equal(switched.failedPages, 1);
+  assert.equal(switched.styled, 2);
+  assert.deepEqual(layers.map(layer => layer.direction), ['rtl', 'rtl', 'ltr']);
+  assert.deepEqual(pages.map(page => page.getPluginData('localization.page-direction.v1')), ['rtl', 'rtl', '']);
+  assert.deepEqual(navigated, [pages[1].id, pages[2].id, pages[0].id]);
+  assert.equal(activeId(), pages[0].id);
+  assert.deepEqual(app.history.map(([event]) => event), ['begin', 'finish', 'begin', 'finish']);
+
+  layers[0].align = 'center';
+  const restored = await app.restore({ scope: 'file' });
+  assert.equal(restored.styleConflicts, 1);
+  assert.equal(restored.stylesRestored, 1);
+  assert.deepEqual(layers.map(layer => layer.direction), ['rtl', 'ltr', 'ltr']);
+  assert.deepEqual(pages.map(page => page.getPluginData('localization.page-direction.v1')), ['rtl', 'auto', '']);
+  assert.equal(activeId(), pages[0].id);
+});
+
+test('a file change during activation stops remaining writes and a second mutation cannot interleave', async () => {
+  const first = rtlText(), second = rtlText();
+  const pages = [page(first), page(second)];
+  const foreign = page(rtlText());
+  let finishNavigation;
+  const app = runtime(pages, { openPage() {
+    return new Promise(resolve => { finishNavigation = resolve; });
+  } });
+  const pending = app.switchDirection('rtl', { scope: 'file' });
+  const rejected = app.apply({ requestId: 2 });
+  assert.match(rejected.error, /in progress/);
+  app.penpot.currentPage = foreign;
+  app.penpot.currentFile = { id: 'foreign', pages: [foreign] };
+  finishNavigation();
+  await pending;
+  const result = app.messages.find(message => message.type === 'direction-result');
+  assert.equal(result.failedPages, 1);
+  assert.equal(result.styled, 1);
+  assert.equal(second.direction, 'ltr');
+  assert.equal(pages[1].getPluginData('localization.page-direction.v1'), '');
+  assert.equal(app.penpot.currentPage, foreign);
+  assert.deepEqual(app.history.map(([event]) => event), ['begin', 'finish']);
+});
+
+test('nested siblings reflect against a stable origin when their group bounds reflow', () => {
+  const left = withPluginData({ id: fixtureId('left'), x: 20, width: 20, constraintsHorizontal: 'left' });
+  const right = withPluginData({ id: fixtureId('right'), x: 70, width: 30, constraintsHorizontal: 'right' });
+  const group = withPluginData({ id: fixtureId('group'), children: [left, right],
+    constraintsHorizontal: 'left',
+    get x() { return Math.min(left.x, right.x); },
+    set x(value) {
+      const delta = value - this.x;
+      left.x += delta;
+      right.x += delta;
+    },
+    get width() { return Math.max(left.x + left.width, right.x + right.width) - this.x; }
+  });
+  const outer = withPluginData({ id: fixtureId('board'), x: 0, width: 300, children: [group] });
+  group.parent = outer;
+  left.parent = group;
+  right.parent = group;
+  const current = boardPage(outer, left, right, group);
+  const app = runtime([current]);
+  const switched = app.switchDirection('rtl');
+  assert.equal(switched.layoutConflicts, 0);
+  assert.deepEqual([group.x, left.x, right.x], [200, 260, 200]);
+  assert.equal(runtime([current]).restore().layoutConflicts, 0);
+  assert.deepEqual([group.x, left.x, right.x], [20, 20, 70]);
+});
+
+test('Restore continues to read absolute positions recorded by older versions', () => {
+  const child = withPluginData({ id: fixtureId('child'), x: 250, width: 30,
+    constraintsHorizontal: 'right' });
+  const board = withPluginData({ id: fixtureId('board'), x: 100, width: 200, children: [child] });
+  child.parent = board;
+  child.setPluginData('localization.rtl.v1', JSON.stringify({ version: 1, layout: {
+    active: 'rtl', baseline: { x: 120, constraintsHorizontal: 'left' },
+    rtlTarget: { x: 250, constraintsHorizontal: 'right' },
+    lastWritten: { x: 250, constraintsHorizontal: 'right' }
+  } }));
+  const app = runtime([boardPage(board, child)]);
+  assert.equal(app.restore().layoutsRestored, 1);
+  assert.deepEqual([child.x, child.constraintsHorizontal], [120, 'left']);
 });

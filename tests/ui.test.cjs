@@ -12,11 +12,18 @@ let nextFixtureId = 0;
 
 async function ui(data, options = {}) {
   const elements = new Map();
-  for (const id of ['language', 'scope', 'status', 'translation-file', 'choose-file', 'source', 'apply', 'restore', 'forget', 'remember-status']) {
+  for (const id of ['language', 'scope', 'status', 'translation-file', 'choose-file', 'source',
+    'apply', 'restore', 'forget', 'remember-status', 'switch-direction',
+    'target-direction', 'direction-choice', 'direction-status']) {
+    const classes = new Set();
     elements.set(id, { value: id === 'scope' ? defaultScope : '', disabled: false,
       hidden: new RegExp(`<[^>]+id="${id}"[^>]*\\bhidden\\b`).test(html),
       clicks: 0, click() { this.clicks++; },
-      textContent: id === 'source' ? 'Source: no file selected' : '', files: [], children: [], replaceChildren(...options) { this.children = options; }, classList: { toggle() {} }, listeners: {},
+      textContent: id === 'source' ? 'Source: no file selected' : '', files: [], children: [], replaceChildren(...options) { this.children = options; },
+      classList: {
+        toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
+        contains(name) { return classes.has(name); }
+      }, listeners: {},
       addEventListener(name, fn) { this.listeners[name] = fn; } });
   }
   const fileInput = elements.get('translation-file');
@@ -31,10 +38,11 @@ async function ui(data, options = {}) {
   const messages = [];
   const storageRequests = [];
   const contextRequests = [];
+  const recoveryRequests = [];
   let receive;
   const parent = { postMessage(msg) {
     const message = JSON.parse(JSON.stringify(msg));
-    if (message.type === 'apply-language' || message.type === 'restore-localization') {
+    if (['apply-language', 'restore-localization', 'switch-direction'].includes(message.type)) {
       if (options.failApplySend) throw new Error('Cannot post message');
       messages.push(message);
     }
@@ -42,6 +50,7 @@ async function ui(data, options = {}) {
       if (options.failContextSend) throw new Error('Cannot post message');
       contextRequests.push(message);
     }
+    else if (message.type === 'recovery-status-request') recoveryRequests.push(message);
     else {
       if (options.failStorageSend === message.action) throw new Error('SANITIZED transport details');
       storageRequests.push(message);
@@ -56,6 +65,11 @@ async function ui(data, options = {}) {
     if (!candidate.id) candidate.id = `page-${++nextFixtureId}`;
     if (normalizedPages.has(candidate)) return candidate;
     normalizedPages.add(candidate);
+    if (!candidate.getPluginData) {
+      const pageData = new Map();
+      candidate.getPluginData = key => pageData.get(key) || '';
+      candidate.setPluginData = (key, value) => pageData.set(key, value);
+    }
     let knownLayers = [];
     const findShapes = candidate.findShapes.bind(candidate);
     candidate.findShapes = criteria => {
@@ -81,7 +95,10 @@ async function ui(data, options = {}) {
   let currentFile = normalizeFile({ id: options.fileId || 'file-a',
     pages: options.pages === undefined ? [currentPage] : options.pages });
   const historyEvents = [];
+  const penpotEvents = {};
   const penpot = {
+    on(type, callback) { penpotEvents[type] = callback; },
+    async openPage(id) { this.currentPage = this.currentFile.pages.find(page => page.id === id); },
     history: {
       undoBlockBegin() { const id = Symbol('history'); historyEvents.push(['begin', id]); return id; },
       undoBlockFinish(id) { historyEvents.push(['finish', id]); }
@@ -93,23 +110,25 @@ async function ui(data, options = {}) {
     },
     ui: { open() {}, onMessage(fn) { receive = fn; }, sendMessage(data) {
       if (options.holdReplies && data.type === 'saved-import-result') options.holdReplies.push(data);
+      else if (options.holdDirectionReplies && data.type === 'direction-result') options.holdDirectionReplies.push(data);
       else if (options.holdApplyReplies && data.type === 'localization-result') options.holdApplyReplies.push(data);
       else if (options.holdRestoreReplies && data.type === 'restore-result') options.holdRestoreReplies.push(data);
       else if (options.holdContextReplies && data.type === 'design-context-result') options.holdContextReplies.push(data);
+      else if (options.holdRecoveryReplies && data.type === 'recovery-status-result') options.holdRecoveryReplies.push(data);
       else queueMicrotask(() => events.message({ source: parent, data: JSON.parse(JSON.stringify(data)) }));
     } }
   };
   Object.defineProperties(penpot, {
     currentPage: {
       get() { return normalizePage(currentPage); },
-      set(value) { currentPage = normalizePage(value); }
+      set(value) { currentPage = normalizePage(value); penpotEvents.pagechange?.(currentPage); }
     },
     currentFile: {
       get() { return normalizeFile(currentFile); },
       set(value) { currentFile = normalizeFile(value); }
     }
   });
-  vm.runInNewContext(pluginScript, { penpot, TextEncoder, console: { error() {} } });
+  vm.runInNewContext(pluginScript, { penpot, TextEncoder, setTimeout, clearTimeout, console: { error() {} } });
   const document = { activeElement: null, getElementById: id => elements.get(id) };
   for (const element of elements.values()) {
     element.focus = () => { document.activeElement = element; };
@@ -122,7 +141,8 @@ async function ui(data, options = {}) {
   });
   vm.runInContext(script, context);
   await new Promise(resolve => setImmediate(resolve));
-  const app = { elements, events, parent, messages, storageRequests, contextRequests, storage,
+  const app = { elements, events, parent, messages, storageRequests, contextRequests,
+    recoveryRequests, storage,
     penpot, document, historyEvents };
   if (data !== undefined) await importFile(app, JSON.stringify(data));
   return app;
@@ -138,7 +158,8 @@ test('loaded dictionary enables selection and sends selected scope and language'
   select.listeners.change();
   assert.equal(app.messages.length, 1);
   assert.deepEqual(app.messages[0], {
-    type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page', translations: dictionary
+    type: 'apply-language', requestId: 1, fileId: 'file-a', language: 'ES', scope: 'page',
+    translations: dictionary
   });
 });
 
@@ -167,12 +188,27 @@ test('status ignores foreign windows and displays parent warnings as text', asyn
   const initial = status.textContent;
   const result = { type: 'localization-result', requestId: replies[0].requestId, ok: true, language: 'ES',
     changed: 1, pageCount: 1, alreadyCorrect: 0, tagged: 2,
-    missing: ['<img src=x onerror=alert(1)>'], skipped: 0, failed: 0, failedPages: 0,
-    conflicts: 0, historyFailed: false, restoreAvailable: true };
+    missing: ['<img src=x onerror=alert(1)>'], skipped: 0, failed: 2, failedPages: 0,
+    conflicts: 0, styled: 0, mirrored: 0, layoutSkipped: 3, layoutUnsupported: 2,
+    layoutSubtreesSkipped: 1, styleConflicts: 0, styleMetadataConflicts: 0,
+    layoutConflicts: 2, layoutMetadataConflicts: 1, styleFailed: 0, styleUnsupported: 0, layoutFailed: 2,
+    layoutFailureReasons: { alignment: 0, constraints: 1, flexDirection: 0, margins: 0,
+      metadata: 0, padding: 0, position: 1, target: 0 },
+    rtl: false, layoutMirrored: false, layoutStateComplete: true,
+    historyFailed: false, restoreAvailable: true };
   app.events.message({ source: {}, data: result });
   assert.equal(status.textContent, initial);
   app.events.message({ source: app.parent, data: result });
   assert.match(status.textContent, /Missing translation keys: <img/);
+  assert.match(status.textContent, /1 component\/grid layout subtree/);
+  assert.match(status.textContent, /2 unsupported layout target/);
+  assert.match(status.textContent, /2 layout property update\(s\) failed: constraints: 1; position: 1/);
+  assert.match(status.textContent, /1 unreadable RTL layout metadata record/);
+  assert.match(status.textContent, /1 externally changed layout shape/);
+  assert.doesNotMatch(status.textContent, /2 layer\(s\) could not be updated/);
+  assert.equal(status.classList.contains('warning'), true);
+  assert.equal(status.classList.contains('error'), false);
+  assert.equal(app.elements.get('apply').textContent, 'Apply to current page');
   app.elements.get('language').value = 'EN';
   app.elements.get('language').listeners.change();
   app.events.message({ source: app.parent, data: { type: 'localization-result', requestId: replies[1].requestId, ok: false, error: 'Failed' } });
@@ -687,6 +723,7 @@ test('default scope applies only to the current page and resets on reopening', a
   app.elements.get('scope').listeners.change();
   assert.equal(other.characters, 'Other original');
   app.elements.get('apply').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(other.characters, 'Hello');
   const reopened = await ui(undefined, { storage: app.storage });
   assert.equal(reopened.elements.get('language').value, 'EN');
@@ -715,6 +752,7 @@ test('a valid reimport automatically reapplies the selected language once using 
   app.elements.get('scope').listeners.change();
   assert.equal(writes.length, 1);
   await importFile(app, '{"ES":{"title":"After"}}');
+  await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(writes, [['current', 'Before'], ['current', 'After'], ['other', 'After']]);
   assert.equal(app.messages.length, 2);
   assert.equal(app.messages[1].requestId, 2);
@@ -829,7 +867,7 @@ test('restore returns plugin-written text to its session baseline and updates it
   const app = await ui({ EN: { title: 'Hello' } }, { currentPage });
   const restore = app.elements.get('restore');
   assert.equal(restore.disabled, true);
-  assert.match(html, /Closing the plugin clears this recovery journal/);
+  assert.match(html, /Closing the plugin clears only text recovery/);
 
   app.elements.get('language').value = 'EN';
   app.elements.get('language').listeners.change();
@@ -913,6 +951,61 @@ test('restore follows page and file scope while a reopened plugin has no recover
   assert.equal(reopened.elements.get('restore').disabled, true);
 });
 
+test('scope changes supersede pending recovery-status checks', async () => {
+  const replies = [];
+  const app = await ui(undefined, { holdRecoveryReplies: replies });
+  assert.equal(app.recoveryRequests.length, 1);
+  const firstRequestId = app.recoveryRequests[0].requestId;
+
+  app.elements.get('scope').value = 'file';
+  app.elements.get('scope').listeners.change();
+  assert.equal(app.recoveryRequests.length, 2);
+  const secondRequestId = app.recoveryRequests[1].requestId;
+  assert.ok(secondRequestId > firstRequestId);
+
+  app.events.message({ source: app.parent,
+    data: { ...replies[0], requestId: firstRequestId, restoreAvailable: false } });
+  assert.equal(app.elements.get('restore').disabled, true, 'the stale page reply is ignored');
+  app.events.message({ source: app.parent,
+    data: { ...replies[1], requestId: secondRequestId, restoreAvailable: true } });
+  assert.equal(app.elements.get('restore').disabled, false,
+    'the current file-scope reply controls availability');
+});
+
+test('restore reports page traversal and unreadable metadata without hiding text recovery', async () => {
+  const pluginData = new Map([['localization.rtl.v1', '{invalid']]);
+  const layer = { id: 'restore-warning-layer', name: 'i18n.title', characters: 'Original',
+    direction: 'ltr', align: 'left',
+    getPluginData: key => pluginData.get(key) || '', setPluginData() {} };
+  let failUnfilteredTraversal = false;
+  const currentPage = { findShapes(criteria) {
+    if (!criteria && failUnfilteredTraversal) throw new Error('Page unavailable');
+    return [layer];
+  } };
+  const app = await ui({ EN: { title: 'Hello' } }, { currentPage });
+  app.elements.get('language').value = 'EN';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(layer.characters, 'Hello');
+
+  failUnfilteredTraversal = true;
+  app.elements.get('restore').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(layer.characters, 'Original');
+  assert.match(app.elements.get('status').textContent, /1 page\(s\) could not be processed/);
+  assert.equal(app.elements.get('status').classList.contains('error'), true);
+
+  failUnfilteredTraversal = false;
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  app.elements.get('restore').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(app.elements.get('status').textContent,
+    /1 unreadable RTL recovery metadata record/);
+  assert.equal(app.elements.get('status').classList.contains('warning'), true);
+  assert.equal(app.elements.get('status').classList.contains('error'), false);
+});
+
 test('restore locks controls and ignores malformed, stale and foreign replies', async () => {
   const replies = [];
   const layer = { name: 'i18n.title', characters: 'Original' };
@@ -968,7 +1061,7 @@ test('failed automatic applies and transport errors release controls and allow r
   app.penpot.currentFile.pages = [app.penpot.currentPage];
   app.elements.get('apply').listeners.click();
   await new Promise(resolve => setImmediate(resolve));
-  assert.match(app.elements.get('status').textContent, /page\(s\) could not be inspected/);
+  assert.match(app.elements.get('status').textContent, /page\(s\) could not be processed/);
   assert.equal(app.elements.get('choose-file').disabled, false);
   app.penpot.currentPage = { findShapes: () => [layer] };
   app.penpot.currentFile.pages = [app.penpot.currentPage];
@@ -1050,6 +1143,7 @@ test('file-scoped reimport remains valid when the active page changes during rea
   app.penpot.currentPage = otherPage;
   finish(new TextEncoder().encode('{"EN":{"title":"After"}}').buffer);
   await pending;
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(current.characters, 'After');
   assert.equal(other.characters, 'After');
   assert.equal(app.messages.at(-1).scope, 'file');
@@ -1245,4 +1339,259 @@ test('Choose a language is a disabled placeholder after imports and reset', asyn
   assert.equal(select.children[0].disabled, true);
   assert.equal(select.disabled, true);
   assert.equal(app.messages.length, 1);
+});
+
+function directionalPage(direction) {
+  const root = { id: 'root' };
+  const makeShape = (shape) => {
+    const data = new Map();
+    return { ...shape, getPluginData: key => data.get(key) || '',
+      setPluginData: (key, value) => data.set(key, value) };
+  };
+  const board = makeShape({ id: 'board', x: 0, width: 200, parent: root });
+  const title = makeShape({ id: 'title', name: 'i18n.title', characters: 'Original',
+    direction, align: direction === 'rtl' ? 'right' : 'left', x: direction === 'rtl' ? 150 : 20,
+    width: 30, constraintsHorizontal: direction === 'rtl' ? 'right' : 'left', parent: board });
+  const plain = makeShape({ id: 'plain', name: 'Untagged', characters: 'Brand',
+    direction, align: 'center' });
+  board.children = [title];
+  const page = { root, findShapes(criteria) {
+    if (!criteria) return [board, title, plain];
+    return criteria.type === 'board' ? [board] : [title, plain];
+  }, getShapeById(id) { return [board, title, plain].find(shape => shape.id === id) || null; } };
+  return { page, title, plain };
+}
+
+test('direction switches both text and layout without a dictionary and survives reopening', async () => {
+  const { page, title, plain } = directionalPage('ltr');
+  const app = await ui(undefined, { currentPage: page });
+  const button = app.elements.get('switch-direction');
+  assert.equal(button.hidden, false);
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, 'Switch to RTL');
+  assert.equal(app.elements.get('direction-choice').hidden, true);
+  assert.equal(app.elements.get('apply').disabled, true);
+  button.focus();
+  button.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual(app.messages[0], { type: 'switch-direction', requestId: 1,
+    fileId: 'file-a', scope: 'page', pageId: page.id, direction: 'rtl' });
+  assert.deepEqual([title.characters, title.direction, title.align, title.x],
+    ['Original', 'rtl', 'right', 150]);
+  assert.deepEqual([plain.characters, plain.direction, plain.align], ['Brand', 'rtl', 'center']);
+  assert.equal(app.historyEvents.length, 2);
+  assert.equal(app.document.activeElement, button);
+  assert.equal(button.textContent, 'Switch to LTR');
+  assert.equal(app.elements.get('direction-choice').hidden, true);
+
+  const reopened = await ui({ EN: { title: 'Hello' } }, { currentPage: page });
+  const select = reopened.elements.get('language');
+  assert.equal(reopened.elements.get('switch-direction').textContent, 'Switch to LTR');
+  select.value = 'EN';
+  select.listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([title.characters, title.direction, title.x], ['Hello', 'rtl', 150]);
+  reopened.elements.get('switch-direction').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([title.characters, title.direction, title.align, title.x],
+    ['Hello', 'ltr', 'left', 20]);
+  assert.equal(select.value, 'EN');
+});
+
+test('navigation refreshes the switch and mixed or unknown scopes require an explicit target', async () => {
+  const first = directionalPage('ltr');
+  const other = directionalPage('rtl');
+  const unknown = directionalPage(null);
+  const app = await ui(undefined, { currentPage: first.page,
+    pages: [first.page, other.page, unknown.page] });
+  const button = app.elements.get('switch-direction');
+  const choice = app.elements.get('direction-choice');
+  const target = app.elements.get('target-direction');
+  app.penpot.currentPage = other.page;
+  // A click based on the previous page's reply is rejected even before the page event arrives.
+  button.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([first.title.direction, other.title.direction], ['ltr', 'rtl']);
+  assert.match(app.elements.get('status').textContent, /Page changed/);
+  assert.equal(button.textContent, 'Switch to LTR');
+  assert.equal(choice.hidden, true);
+
+  app.penpot.currentPage = unknown.page;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(app.elements.get('direction-status').textContent, /Unknown/);
+  assert.equal(choice.hidden, false);
+  assert.equal(button.disabled, true);
+  button.listeners.click();
+  assert.equal(app.messages.length, 1, 'the switch requires a target');
+  target.value = 'rtl';
+  target.listeners.change();
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, 'Switch to RTL');
+  assert.equal(app.messages.length, 1, 'choosing a target does not write');
+
+  const scope = app.elements.get('scope');
+  scope.value = 'file';
+  scope.listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(app.elements.get('direction-status').textContent, /Mixed/);
+  assert.equal(choice.hidden, false);
+  assert.equal(target.value, '');
+  assert.equal(button.disabled, true);
+  target.value = 'ltr';
+  target.listeners.change();
+  button.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.messages.at(-1).scope, 'file');
+  assert.equal(other.title.x, 20, 'an initially RTL page mirrors into LTR');
+  assert.equal(unknown.title.direction, null);
+  assert.match(app.elements.get('status').textContent, /kept their unset direction/);
+  assert.equal(button.textContent, 'Switch to RTL');
+  assert.equal(choice.hidden, true);
+});
+
+test('a partial direction switch reports skipped layers and ignores unrelated replies while busy', async () => {
+  const { page, title, plain } = directionalPage('ltr');
+  plain.direction = 'mixed';
+  const replies = [];
+  const app = await ui(undefined, { currentPage: page, holdDirectionReplies: replies });
+  const button = app.elements.get('switch-direction');
+  const target = app.elements.get('target-direction');
+  assert.equal(app.elements.get('direction-choice').hidden, false);
+  target.value = 'rtl';
+  target.listeners.change();
+  button.listeners.click();
+  assert.equal(app.elements.get('translation-file').disabled, true);
+  assert.equal(target.disabled, true);
+  assert.equal(button.disabled, true);
+  app.events.message({ source: {}, data: replies[0] });
+  app.events.message({ source: app.parent, data: { ...replies[0], type: 'localization-result' } });
+  assert.equal(button.disabled, true);
+
+  app.events.message({ source: app.parent, data: replies[0] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(app.elements.get('translation-file').disabled, false);
+  assert.equal(plain.direction, 'mixed');
+  assert.equal(title.direction, 'rtl');
+  assert.match(app.elements.get('status').textContent, /mixed direction or alignment/);
+  assert.equal(app.elements.get('status').classList.contains('warning'), true);
+  assert.equal(button.textContent, 'Switch to LTR');
+  assert.equal(app.elements.get('direction-choice').hidden, true);
+});
+
+test('Arabic application updates text direction and reports RTL styling without changing JSON', async () => {
+  const pluginData = new Map();
+  const layer = { id: 'rtl-layer', name: 'i18n.title', characters: 'Original',
+    direction: 'ltr', align: 'left',
+    getPluginData: key => pluginData.get(key) || '',
+    setPluginData: (key, value) => pluginData.set(key, value) };
+  const app = await ui({ ar: { title: 'مرحبا' } }, {
+    currentPage: { findShapes: () => [layer] }
+  });
+  app.elements.get('language').value = 'ar';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(layer.characters, 'مرحبا');
+  assert.equal(layer.direction, 'rtl');
+  assert.equal(layer.align, 'right');
+  assert.match(app.elements.get('status').textContent, /RTL direction or alignment updated/);
+  assert.deepEqual(app.messages[0].translations, { ar: { title: 'مرحبا' } });
+});
+
+test('durable RTL style recovery is available after reopening while text stays session-only', async () => {
+  const pluginData = new Map();
+  const layer = { id: 'rtl-reopen-layer', name: 'i18n.title', characters: 'Original',
+    direction: 'ltr', align: 'left',
+    getPluginData: key => pluginData.get(key) || '',
+    setPluginData: (key, value) => pluginData.set(key, value) };
+  const currentPage = { findShapes: () => [layer] };
+  const first = await ui({ ar: { title: 'مرحبا' } }, { currentPage });
+  first.elements.get('language').value = 'ar';
+  first.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+
+  const reopened = await ui(undefined, { currentPage });
+  assert.equal(reopened.elements.get('restore').disabled, false);
+  reopened.elements.get('restore').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(layer.characters, 'مرحبا');
+  assert.equal(layer.direction, 'ltr');
+  assert.equal(layer.align, 'left');
+  assert.match(reopened.elements.get('status').textContent, /Restored RTL styling/);
+});
+
+test('RTL text previously applied by language can still switch its LTR layout to RTL', async () => {
+  const { page, title, plain } = directionalPage('ltr');
+  const findShapes = page.findShapes.bind(page);
+  page.findShapes = criteria => findShapes(criteria).filter(shape => shape !== plain);
+  const app = await ui({ ar: { title: 'مرحبا' } }, { currentPage: page });
+  app.elements.get('language').value = 'ar';
+  app.elements.get('language').listeners.change();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([title.characters, title.direction, title.x], ['مرحبا', 'rtl', 20]);
+  assert.match(app.elements.get('direction-status').textContent, /Mixed/);
+  const target = app.elements.get('target-direction');
+  target.value = 'rtl';
+  target.listeners.change();
+  app.elements.get('switch-direction').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([title.characters, title.direction, title.x], ['مرحبا', 'rtl', 150]);
+  assert.equal(app.elements.get('switch-direction').textContent, 'Switch to LTR');
+});
+
+test('a layout confirmation failure reports partial success and can be recovered after reopening', async () => {
+  const { page, title } = directionalPage('ltr');
+  let rejectConfirmation = true;
+  const setPluginData = title.setPluginData;
+  title.setPluginData = (key, value) => {
+    if (rejectConfirmation && JSON.parse(value).layout?.active === 'baseline') {
+      rejectConfirmation = false;
+      throw new Error('SANITIZED final layout metadata failure');
+    }
+    setPluginData(key, value);
+  };
+  const app = await ui(undefined, { currentPage: page });
+  app.elements.get('switch-direction').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  app.elements.get('switch-direction').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.deepEqual([title.direction, title.x, title.constraintsHorizontal], ['ltr', 20, 'left']);
+  assert.match(app.elements.get('status').textContent, /recovery metadata: 1/);
+  assert.equal(app.elements.get('status').classList.contains('warning'), true);
+  assert.equal(app.elements.get('direction-choice').hidden, false);
+  assert.match(title.getPluginData('localization.rtl.v1'), /pending-baseline/);
+
+  const reopened = await ui(undefined, { currentPage: page });
+  reopened.elements.get('restore').listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([title.direction, title.x, title.characters], ['ltr', 20, 'Original']);
+  assert.equal(reopened.elements.get('restore').disabled, true);
+});
+
+test('an incomplete direction switch exposes its retry and completes after metadata is writable', async () => {
+  const { page, title } = directionalPage('ltr');
+  const setData = title.setPluginData;
+  title.setPluginData = () => {};
+  const app = await ui(undefined, { currentPage: page });
+  const button = app.elements.get('switch-direction');
+  const choice = app.elements.get('direction-choice');
+  const target = app.elements.get('target-direction');
+  button.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(app.elements.get('direction-status').textContent, /Conversion incomplete/);
+  assert.equal(choice.hidden, false);
+  assert.equal(target.value, 'rtl', 'the failed target stays selected for retry');
+  assert.equal(button.textContent, 'Switch to RTL');
+  assert.equal(button.disabled, false);
+  assert.deepEqual([title.direction, title.x], ['ltr', 20]);
+
+  title.setPluginData = setData;
+  button.listeners.click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(app.elements.get('direction-status').textContent, /Direction: RTL/);
+  assert.equal(choice.hidden, true);
+  assert.equal(button.textContent, 'Switch to LTR');
+  assert.equal(button.disabled, false);
+  assert.deepEqual([title.direction, title.x], ['rtl', 150]);
 });

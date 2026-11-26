@@ -10,7 +10,7 @@ This document tracks unfinished release work. Implemented behavior and architect
 
 ## Implementation order
 
-1. Planning, history, restore, full request validation, mutation controls, and partial-failure results are implemented with automated regression coverage and reported functional use in Penpot.
+1. Planning, history, restore, full request validation, mutation controls, partial-failure results, automatic RTL text direction for pages without a chosen direction and reversible LTR/RTL conversion of text and layout are implemented with automated regression coverage. Automatic language/reimport application preserves layout state. Literal translation and session restore have reported functional use in Penpot. A 2026-11-18 Penpot 2.19.3-RC1 report exposed optional/host-rejected layout values and repeated recovery diagnostics; the adapter now filters unsupported values, isolates property failures, and safely skips unreadable metadata. A post-fix real-host RTL compatibility pass remains optional and pending.
 2. Prepare the release package for owner review.
 
 ## Release package checklist

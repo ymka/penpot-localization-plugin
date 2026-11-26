@@ -4,10 +4,18 @@
  * Text layers to localize must be named i18n.<translation-key>.
  */
 
-penpot.ui.open("Penpot Localization", "index.html", { width: 360, height: 620 });
+penpot.ui.open("Penpot Localization", "index.html", { width: 360, height: 700 });
 
 const MAX_BYTES = 1024 * 1024;
 const STORAGE_PREFIX = "localization.saved-import.v1:";
+const RTL_METADATA_KEY = "localization.rtl.v1";
+const PAGE_DIRECTION_KEY = "localization.page-direction.v1";
+const RTL_BASE_LANGUAGES = new Set([
+  "ar", "ckb", "dv", "fa", "he", "ps", "sd", "ug", "ur", "yi"
+]);
+const RTL_SCRIPT_SUBTAGS = new Set([
+  "adlm", "arab", "hebr", "mand", "nkoo", "rohg", "syrc", "thaa"
+]);
 const MIXED_TEXT_STYLE_PROPERTIES = [
   "fontId",
   "fontFamily",
@@ -23,7 +31,146 @@ const MIXED_TEXT_STYLE_PROPERTIES = [
   "align",
   "fills"
 ];
+const LAYOUT_FAILURE_REASONS = [
+  "alignment", "constraints", "flexDirection", "margins",
+  "metadata", "padding", "position", "target"
+];
 const recoveryJournal = new Map();
+let mutationPending = false;
+
+function isDirection(value) {
+  return value === "ltr" || value === "rtl";
+}
+
+function oppositeDirection(direction) {
+  return direction === "rtl" ? "ltr" : "rtl";
+}
+
+function isRtlLanguage(language) {
+  const subtags = language.toLowerCase().split("-");
+  return RTL_BASE_LANGUAGES.has(subtags[0])
+    || subtags.slice(1).some(subtag => RTL_SCRIPT_SUBTAGS.has(subtag));
+}
+
+function swapHorizontal(value) {
+  if (value === "left") return "right";
+  if (value === "right") return "left";
+  if (value === "start") return "end";
+  if (value === "end") return "start";
+  if (value === "row") return "row-reverse";
+  if (value === "row-reverse") return "row";
+  return value;
+}
+
+function sameRecord(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function isPlainRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function validManagedValue(field, value) {
+  if (["x", "parentOffsetX", "leftMargin", "rightMargin"].includes(field)) {
+    return Number.isFinite(value);
+  }
+  if (["flexLeftPadding", "flexRightPadding"].includes(field)) {
+    return Number.isFinite(value) && value >= 0;
+  }
+  if (field === "direction") return [null, "ltr", "rtl"].includes(value);
+  if (field === "align") {
+    return [null, "left", "right", "center", "justify"].includes(value);
+  }
+  if (field === "constraintsHorizontal") {
+    return ["center", "left", "right", "leftright", "scale"].includes(value);
+  }
+  if (field === "flexDir") {
+    return ["row", "row-reverse", "column", "column-reverse"].includes(value);
+  }
+  if (field === "flexAlignItems") {
+    return ["start", "end", "center", "stretch"].includes(value);
+  }
+  if (field === "alignSelf") {
+    return ["start", "end", "center", "auto", "stretch"].includes(value);
+  }
+  return false;
+}
+
+function validateMetadataSection(section, name) {
+  if (!isPlainRecord(section)
+      || !["baseline", "rtl", "ltr", "pending-baseline", "pending-rtl", "pending-ltr"].includes(section.active)
+      || !isPlainRecord(section.baseline) || !isPlainRecord(section.rtlTarget)
+      || !isPlainRecord(section.lastWritten)
+      || Object.keys(section).some(key => !["active", "baseline", "rtlTarget", "lastWritten",
+        ...(name === "layout" ? ["baselineDirection", "parentId"] : ["ltrTarget"])].includes(key))
+      || (section.baselineDirection !== undefined && !isDirection(section.baselineDirection))
+      || (Object.hasOwn(section.baseline, "parentOffsetX")
+        ? !isValidId(section.parentId) || Object.hasOwn(section.baseline, "x")
+        : Object.hasOwn(section, "parentId"))
+      || (section.ltrTarget !== undefined && !isPlainRecord(section.ltrTarget))
+      || (["ltr", "pending-ltr"].includes(section.active) && !section.ltrTarget)) {
+    throw new Error("Invalid RTL metadata.");
+  }
+  const allowed = name === "textStyle" ? ["align", "direction"] : [
+    "alignSelf", "constraintsHorizontal", "flexAlignItems", "flexDir",
+    "flexLeftPadding", "flexRightPadding", "leftMargin", "rightMargin", "x", "parentOffsetX"
+  ];
+  const baselineKeys = Object.keys(section.baseline).sort();
+  if (!baselineKeys.length || baselineKeys.some(key => !allowed.includes(key))) {
+    throw new Error("Invalid RTL metadata.");
+  }
+  for (const values of [section.baseline, section.rtlTarget, section.lastWritten,
+    ...(section.ltrTarget ? [section.ltrTarget] : [])]) {
+    const keys = Object.keys(values).sort();
+    if (!sameRecord(keys, baselineKeys)
+        || keys.some(key => !validManagedValue(key, values[key]))) {
+      throw new Error("Invalid RTL metadata.");
+    }
+  }
+}
+
+function readRtlMetadata(shape) {
+  if (!shape || typeof shape.getPluginData !== "function") return null;
+  const value = shape.getPluginData(RTL_METADATA_KEY);
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value !== "string" || value.length > 8192) {
+    throw new Error("Invalid RTL metadata.");
+  }
+  const record = JSON.parse(value);
+  if (!isPlainRecord(record) || record.version !== 1
+      || Object.keys(record).some(key => !["version", "textStyle", "layout"].includes(key))) {
+    throw new Error("Invalid RTL metadata.");
+  }
+  if (Object.prototype.hasOwnProperty.call(record, "textStyle")) {
+    validateMetadataSection(record.textStyle, "textStyle");
+  }
+  if (Object.prototype.hasOwnProperty.call(record, "layout")) {
+    validateMetadataSection(record.layout, "layout");
+  }
+  return record;
+}
+
+function inspectRtlMetadata(shape) {
+  try {
+    return { metadata: readRtlMetadata(shape), invalid: false };
+  } catch (error) {
+    return { metadata: null, invalid: true };
+  }
+}
+
+function writeRtlMetadata(shape, section, value) {
+  if (!shape || typeof shape.getPluginData !== "function"
+      || typeof shape.setPluginData !== "function") {
+    throw new Error("RTL metadata is unavailable.");
+  }
+  validateMetadataSection(value, section);
+  const current = readRtlMetadata(shape) || { version: 1 };
+  current[section] = value;
+  shape.setPluginData(RTL_METADATA_KEY, JSON.stringify(current));
+  if (!sameRecord(readRtlMetadata(shape)?.[section], value)) {
+    throw new Error("RTL metadata readback failed.");
+  }
+}
 
 function hasMixedTextStyle(layer) {
   return MIXED_TEXT_STYLE_PROPERTIES.some(property => layer[property] === "mixed");
@@ -166,7 +313,9 @@ function captureContext(message) {
   }
   if (message.scope === "page" && message.pageId !== undefined
       && message.pageId !== currentPage.id) {
-    throw new Error("Page changed while reading translations. Review the scope and apply again.");
+    throw new Error(message.type === "switch-direction"
+      ? "Page changed. Review the scope and try again."
+      : "Page changed while reading translations. Review the scope and apply again.");
   }
   const pages = message.scope === "file" ? currentFile.pages : [currentPage];
   if (!Array.isArray(pages) || !pages.length) throw new Error("No pages are available.");
@@ -242,28 +391,483 @@ function removeRecovery(fileId, pageId, shapeId) {
   if (!fileJournal.size) recoveryJournal.delete(fileId);
 }
 
-function planApply(context, strings) {
+function planManagedSection(section, sectionName, current, rtlTarget, active, baselineDirection, parentId) {
+  if (!section || !sameRecord(current, section.baseline)
+      && !sameRecord(current, section.lastWritten)) {
+    if (!section && active === "baseline") return { operation: null, conflict: false };
+    const pendingTransition = section && section.active.startsWith("pending-")
+      && Object.keys(section.baseline).every(key => current[key] === section.baseline[key]
+        || current[key] === section.rtlTarget[key]
+        || (section.ltrTarget && current[key] === section.ltrTarget[key]));
+    if (section && section.active !== "baseline" && !pendingTransition) {
+      return { operation: null, conflict: true };
+    }
+    if (!pendingTransition) {
+      baselineDirection = section ? section.baselineDirection : baselineDirection;
+      section = { active: "baseline", baseline: current, rtlTarget, lastWritten: current };
+      if (baselineDirection) section.baselineDirection = baselineDirection;
+      if (parentId) section.parentId = parentId;
+    }
+  }
+  // Layout records keep the original rtlTarget key for the mirrored geometry in either direction.
+  let refreshedRtlTarget = section.rtlTarget;
+  const position = Object.hasOwn(current, "parentOffsetX") ? "parentOffsetX" : "x";
+  if (sectionName === "layout" && active === "rtl" && !section.active.startsWith("pending-")
+      && sameRecord(current, section.baseline)) {
+    refreshedRtlTarget = rtlTarget;
+  } else if (sectionName === "layout" && active === "rtl" && section.active === "rtl"
+      && sameRecord(current, section.lastWritten)
+      && Object.hasOwn(current, position) && Object.hasOwn(rtlTarget, position)) {
+    refreshedRtlTarget = {
+      ...section.rtlTarget,
+      [position]: rtlTarget[position] + current[position] - section.baseline[position]
+    };
+  }
+  let ltrTarget = section.ltrTarget;
+  if (sectionName === "textStyle" && active === "ltr" && !ltrTarget) {
+    const { direction, align } = section.baseline;
+    ltrTarget = { direction: "ltr", align: direction === "rtl" ? swapHorizontal(align) : align };
+  }
+  const target = active === "rtl" ? refreshedRtlTarget
+    : active === "ltr" ? ltrTarget : section.baseline;
+  const nextSection = {
+    ...section,
+    ...(ltrTarget ? { ltrTarget } : {}),
+    active,
+    baseline: section.baseline,
+    rtlTarget: refreshedRtlTarget,
+    lastWritten: target
+  };
+  const metadataChanged = !sameRecord(section, nextSection);
+  if (!metadataChanged && sameRecord(current, target)) {
+    return { operation: null, conflict: false };
+  }
+  return {
+    operation: { current, target, metadata: nextSection },
+    conflict: false
+  };
+}
+
+function textStyleValues(layer) {
+  if (![null, "ltr", "rtl"].includes(layer.direction)
+      || ![null, "left", "right", "center", "justify"].includes(layer.align)) {
+    throw new Error("Unsupported text direction or alignment.");
+  }
+  return { direction: layer.direction, align: layer.align };
+}
+
+function rtlTextStyle(values, explicit = false) {
+  return { direction: "rtl", align: explicit && values.direction === "rtl"
+    ? values.align : swapHorizontal(values.align) };
+}
+
+function addLayoutCandidate(candidates, shape, current, rtlTarget) {
+  if (!isValidId(shape && shape.id)) return;
+  let candidate = candidates.get(shape.id);
+  if (!candidate) {
+    candidate = { shape, current: {}, rtlTarget: {} };
+    candidates.set(shape.id, candidate);
+  }
+  Object.assign(candidate.current, current);
+  Object.assign(candidate.rtlTarget, rtlTarget);
+}
+
+function addManagedLayoutValue(current, rtlTarget, field, before, after) {
+  if (!validManagedValue(field, before) || !validManagedValue(field, after)) return false;
+  current[field] = before;
+  rtlTarget[field] = after;
+  return true;
+}
+
+function recordLayoutSkip(result, type) {
+  result.layoutSkipped += 1;
+  if (type === "subtree") result.layoutSubtreesSkipped += 1;
+  else result.layoutUnsupported += 1;
+}
+
+function recordPageFailure(result, pageId) {
+  if (result.failedPageIds.has(pageId)) return;
+  result.failedPageIds.add(pageId);
+  result.failedPages += 1;
+}
+
+function layoutFailureReason(field) {
+  if (["flexAlignItems", "alignSelf"].includes(field)) return "alignment";
+  if (field === "constraintsHorizontal") return "constraints";
+  if (field === "flexDir") return "flexDirection";
+  if (["leftMargin", "rightMargin"].includes(field)) return "margins";
+  if (["flexLeftPadding", "flexRightPadding"].includes(field)) return "padding";
+  if (field === "x" || field === "parentOffsetX") return "position";
+  if (field === "metadata") return "metadata";
+  return "target";
+}
+
+function recordManagedFailure(plan, kind, field) {
+  plan.failed += 1;
+  if (kind === "style") {
+    plan.styleFailed += 1;
+    return;
+  }
+  plan.layoutFailed += 1;
+  plan.layoutFailureReasons[layoutFailureReason(field)] += 1;
+}
+
+function isComponentManaged(shape) {
+  return typeof shape.isComponentInstance === "function" && shape.isComponentInstance();
+}
+
+function collectMirroredLayout(shape, candidates, result) {
+  if (!shape || isComponentManaged(shape)) {
+    recordLayoutSkip(result, "subtree");
+    return;
+  }
+  if (shape.grid) {
+    recordLayoutSkip(result, "subtree");
+    return;
+  }
+  addLayoutCandidate(candidates, shape, {}, {});
+  const flex = shape.flex;
+  if (flex) {
+    const current = {};
+    const rtlTarget = {};
+    let unsupported = false;
+    unsupported = !addManagedLayoutValue(current, rtlTarget, "flexDir",
+      flex.dir, swapHorizontal(flex.dir)) || unsupported;
+    const validPadding = validManagedValue("flexLeftPadding", flex.leftPadding)
+      && validManagedValue("flexRightPadding", flex.rightPadding);
+    if (validPadding) {
+      addManagedLayoutValue(current, rtlTarget, "flexLeftPadding",
+        flex.leftPadding, flex.rightPadding);
+      addManagedLayoutValue(current, rtlTarget, "flexRightPadding",
+        flex.rightPadding, flex.leftPadding);
+    } else {
+      unsupported = true;
+    }
+    if (flex.dir === "column" || flex.dir === "column-reverse") {
+      unsupported = !addManagedLayoutValue(current, rtlTarget, "flexAlignItems",
+        flex.alignItems, swapHorizontal(flex.alignItems)) || unsupported;
+    }
+    if (Object.keys(current).length) {
+      addLayoutCandidate(candidates, shape, current, rtlTarget);
+    }
+    if (unsupported) {
+      recordLayoutSkip(result, "unsupported");
+    }
+  }
+  if (!Array.isArray(shape.children)) return;
+  for (const child of shape.children) {
+    if (!child || isComponentManaged(child)) {
+      recordLayoutSkip(result, "subtree");
+      continue;
+    }
+    if (child.grid) {
+      recordLayoutSkip(result, "subtree");
+      continue;
+    }
+    const current = {};
+    const rtlTarget = {};
+    const layoutChild = child.layoutChild;
+    if (layoutChild && layoutChild.marginType === "multiple") {
+      const validMargins = validManagedValue("leftMargin", layoutChild.leftMargin)
+        && validManagedValue("rightMargin", layoutChild.rightMargin);
+      if (validMargins) {
+        addManagedLayoutValue(current, rtlTarget, "leftMargin",
+          layoutChild.leftMargin, layoutChild.rightMargin);
+        addManagedLayoutValue(current, rtlTarget, "rightMargin",
+          layoutChild.rightMargin, layoutChild.leftMargin);
+      } else {
+        recordLayoutSkip(result, "unsupported");
+      }
+    }
+    if (layoutChild && flex && (flex.dir === "column" || flex.dir === "column-reverse")) {
+      if (!addManagedLayoutValue(current, rtlTarget, "alignSelf",
+        layoutChild.alignSelf, swapHorizontal(layoutChild.alignSelf))) {
+        recordLayoutSkip(result, "unsupported");
+      }
+    }
+    const reflectPosition = !flex || (layoutChild && layoutChild.absolute === true);
+    if (reflectPosition) {
+      if (![child.x, child.width, shape.x, shape.width].every(Number.isFinite)) {
+        throw new Error("Invalid layout geometry.");
+      }
+      const offset = child.x - shape.x;
+      addManagedLayoutValue(current, rtlTarget, "parentOffsetX", offset,
+        shape.width - offset - child.width);
+      if (!addManagedLayoutValue(current, rtlTarget, "constraintsHorizontal",
+        child.constraintsHorizontal, swapHorizontal(child.constraintsHorizontal))) {
+        recordLayoutSkip(result, "unsupported");
+      }
+    }
+    if (Object.keys(current).length) {
+      addLayoutCandidate(candidates, child, current, rtlTarget);
+    }
+    collectMirroredLayout(child, candidates, result);
+  }
+}
+
+function allPageShapes(page) {
+  const shapes = page.findShapes();
+  if (!Array.isArray(shapes)) throw new Error("Invalid shape result.");
+  return shapes;
+}
+
+function readPageDirection(page) {
+  if (typeof page.getPluginData !== "function") return "";
+  const value = page.getPluginData(PAGE_DIRECTION_KEY);
+  if (value === null || value === undefined || value === "" || value === "auto") return "";
+  if (!isDirection(value) && (typeof value !== "string" || !/^pending:(ltr|rtl):(ltr|rtl)$/.test(value))) {
+    throw new Error("Invalid saved page direction.");
+  }
+  return value;
+}
+
+function writePageDirection(page, direction) {
+  page.setPluginData(PAGE_DIRECTION_KEY, direction || "auto");
+  if (readPageDirection(page) !== direction) throw new Error("Page direction readback failed.");
+}
+
+function inferDirection(values) {
+  const directions = new Set(values);
+  if (directions.has("mixed") || directions.has("ltr") && directions.has("rtl")) return "mixed";
+  if (directions.size === 1) {
+    const [direction] = directions;
+    if (isDirection(direction)) return direction;
+  }
+  return "unknown";
+}
+
+function inferLayoutDirection(layers, shapes) {
+  const managedDirections = new Set();
+  for (const shape of shapes) {
+    const section = inspectRtlMetadata(shape).metadata?.layout;
+    if (section && section.active !== "baseline") {
+      const baseline = section.baselineDirection || "ltr";
+      managedDirections.add(section.active === "rtl" ? oppositeDirection(baseline) : "mixed");
+    }
+  }
+  if (managedDirections.size) return inferDirection(managedDirections);
+  return inferDirection(layers.map(layer => {
+    try {
+      const direction = layer.direction;
+      const previous = inspectRtlMetadata(layer).metadata?.textStyle;
+      // Language Apply can change the text on a page without mirroring its layout.
+      return previous?.active === "rtl" && direction === previous.lastWritten.direction
+        ? previous.baseline.direction : direction;
+    } catch (error) {
+      return "unknown";
+    }
+  }));
+}
+
+function inspectActiveRtlMetadata(context, includeDirection = false) {
+  let restoreAvailable = false;
+  let layoutMirrored = false;
+  let complete = true;
+  const directions = [];
+  for (const page of context.pages) {
+    let shapes;
+    let remembered;
+    try {
+      remembered = readPageDirection(page.proxy);
+      if (remembered) restoreAvailable = true;
+      if (remembered && !isDirection(remembered)) complete = false;
+    } catch (error) {
+      complete = false;
+    }
+    try {
+      shapes = allPageShapes(page.proxy);
+    } catch (error) {
+      complete = false;
+      directions.push(isDirection(remembered) ? remembered : "unknown");
+      continue;
+    }
+    if (includeDirection) {
+      let direction = isDirection(remembered) ? remembered : "unknown";
+      if (remembered === "") {
+        try {
+          const layers = page.proxy.findShapes({ type: "text" });
+          const text = inferDirection(layers.map(layer => layer.direction));
+          direction = inferDirection([text, inferLayoutDirection(layers, shapes)]);
+        } catch (error) {
+          // Keep the direction unknown when the host cannot inspect the page.
+        }
+      }
+      directions.push(direction);
+    }
+    for (const shape of shapes) {
+      const { metadata } = inspectRtlMetadata(shape);
+      if (!metadata) continue;
+      if (metadata.textStyle && metadata.textStyle.active !== "baseline") {
+        restoreAvailable = true;
+      }
+      if (metadata.layout && metadata.layout.active !== "baseline") {
+        restoreAvailable = true;
+        if (metadata.layout.active === "rtl") layoutMirrored = true;
+        if (metadata.layout.active.startsWith("pending-")) complete = false;
+      }
+    }
+  }
+  return { restoreAvailable, layoutMirrored, complete, direction: inferDirection(directions) };
+}
+
+function handleRecoveryStatus(message) {
+  const replyType = "recovery-status-result";
+  try {
+    const context = captureContext(message);
+    const state = inspectActiveRtlMetadata(context, true);
+    penpot.ui.sendMessage({
+      type: replyType,
+      requestId: message.requestId,
+      ok: true,
+      restoreAvailable: hasRecovery(context.fileId) || state.restoreAvailable,
+      layoutMirrored: state.layoutMirrored,
+      layoutStateComplete: state.complete,
+      direction: state.direction,
+      pageId: context.currentPageId
+    });
+  } catch (error) {
+    sendOperationError(replyType,
+      error instanceof Error ? error.message : "Cannot inspect recovery state.",
+      message.requestId);
+  }
+}
+
+function planLayout(page, direction, sourceDirection, result) {
+  const candidates = new Map();
+  try {
+    const boards = page.proxy.findShapes({ type: "board" });
+    if (!Array.isArray(boards)) throw new Error("Invalid shape result.");
+    for (const board of boards) {
+      if (board && board.parent && page.proxy.root
+          && board.parent.id === page.proxy.root.id) {
+        collectMirroredLayout(board, candidates, result);
+      }
+    }
+  } catch (error) {
+    recordPageFailure(result, page.id);
+    console.error("Cannot inspect page layout.");
+  }
+  for (const candidate of candidates.values()) {
+    try {
+      const { metadata, invalid } = inspectRtlMetadata(candidate.shape);
+      if (invalid) {
+        result.layoutConflicts += 1;
+        result.layoutMetadataConflicts += 1;
+        continue;
+      }
+      const section = metadata?.layout;
+      const baselineDirection = section ? section.baselineDirection || "ltr" : sourceDirection;
+      const active = direction === baselineDirection ? "baseline" : "rtl";
+      const shape = candidate.shape;
+      const fields = section ? Object.keys(section.baseline) : Object.keys(candidate.current)
+        .filter(field => candidate.current[field] !== candidate.rtlTarget[field]);
+      if (!fields.length) continue;
+      const parentId = fields.includes("parentOffsetX") ? shape.parent?.id : undefined;
+      if (fields.includes("parentOffsetX") && !isValidId(parentId)
+          || section?.parentId && section.parentId !== parentId) {
+        result.layoutConflicts += 1;
+        continue;
+      }
+      const current = managedValues(shape, section?.lastWritten
+        ?? Object.fromEntries(fields.map(field => [field, candidate.current[field]])), "layout");
+      const rtlTarget = Object.fromEntries(fields.map(field => {
+        let target = candidate.rtlTarget[field];
+        if (field === "x" && Object.hasOwn(candidate.rtlTarget, "parentOffsetX")) {
+          target = shape.parent.x + candidate.rtlTarget.parentOffsetX;
+        }
+        return [field, target ?? section?.rtlTarget[field]];
+      }));
+      const planned = planManagedSection(section, "layout", current, rtlTarget,
+        active, baselineDirection === "rtl" ? baselineDirection : undefined, parentId);
+      if (planned.conflict) {
+        result.layoutConflicts += 1;
+      } else if (planned.operation) {
+        result.layoutOperations.push({
+          pageId: page.id,
+          shapeId: candidate.shape.id,
+          ...planned.operation
+        });
+      }
+    } catch (error) {
+      result.failed += 1;
+      console.error("Cannot plan directional layout.");
+    }
+  }
+}
+
+function planPageDirection(page, layers, direction, result) {
+  const previous = readPageDirection(page.proxy);
+  if (typeof page.proxy.getPluginData !== "function"
+      || typeof page.proxy.setPluginData !== "function") {
+    throw new Error("Page direction storage is unavailable.");
+  }
+  const inferred = (isDirection(previous) ? previous : previous.split(":")[1])
+    || inferLayoutDirection(layers, allPageShapes(page.proxy));
+  const source = isDirection(inferred) ? inferred : oppositeDirection(direction);
+  planLayout(page, direction, source, result);
+  return { pageId: page.id, previous, direction, pending: `pending:${source}:${direction}` };
+}
+
+function planApply(context, strings, language, direction = null) {
+  const rtl = direction ? direction === "rtl" : isRtlLanguage(language);
   const result = {
     pageCount: context.pages.length,
+    rtl,
     tagged: 0,
     alreadyCorrect: 0,
     skipped: 0,
     failed: 0,
     failedPages: 0,
+    failedPageIds: new Set(),
+    blockedPageIds: new Set(),
+    styleConflicts: 0,
+    styleMetadataConflicts: 0,
+    layoutConflicts: 0,
+    layoutMetadataConflicts: 0,
+    layoutSkipped: 0,
+    layoutUnsupported: 0,
+    layoutSubtreesSkipped: 0,
+    styleFailed: 0,
+    styleUnsupported: 0,
+    layoutFailed: 0,
+    layoutFailureReasons: Object.fromEntries(LAYOUT_FAILURE_REASONS.map(reason => [reason, 0])),
     missing: new Set(),
-    operations: []
+    operations: [],
+    styleOperations: [],
+    layoutOperations: [],
+    pageOperations: []
   };
   for (const page of context.pages) {
     let textLayers;
+    let keepPageDirection;
+    let pageOperation;
+    const layoutStart = result.layoutOperations.length;
+    const styleStart = result.styleOperations.length;
+    const failuresBefore = managedIssues(result);
     try {
       textLayers = page.proxy.findShapes({ type: "text" });
       if (!Array.isArray(textLayers)) throw new Error("Invalid shape result.");
+      if (direction) {
+        pageOperation = planPageDirection(page, textLayers, direction, result);
+      } else {
+        try {
+          keepPageDirection = Boolean(readPageDirection(page.proxy));
+        } catch (error) {
+          keepPageDirection = true;
+          result.styleConflicts += 1;
+          result.styleMetadataConflicts += 1;
+        }
+      }
     } catch (error) {
-      result.failedPages += 1;
+      recordPageFailure(result, page.id);
       console.error("Cannot inspect a page.");
       continue;
     }
     for (const layer of textLayers) {
+      if (direction) {
+        planTextDirection(page.id, layer, direction, result);
+        continue;
+      }
       let name;
       try {
         name = layer.name;
@@ -283,59 +887,342 @@ function planApply(context, strings) {
       try {
         const before = layer.characters;
         const after = strings[key];
-        if (before === after) {
-          result.alreadyCorrect += 1;
-        } else if (!isValidId(layer.id)) {
+        const inspected = inspectRtlMetadata(layer);
+        const metadata = inspected.metadata;
+        const managesStyle = !keepPageDirection && (rtl || Boolean(metadata && metadata.textStyle
+          && metadata.textStyle.active !== "baseline"));
+        if (!isValidId(layer.id)) {
           result.failed += 1;
-        } else if (hasMixedTextStyle(layer)) {
+        } else if ((before !== after || managesStyle) && hasMixedTextStyle(layer)) {
           result.skipped += 1;
         } else {
-          result.operations.push({
-            fileId: context.fileId,
-            pageId: page.id,
-            shapeId: layer.id,
-            before,
-            after
+          if (before === after) result.alreadyCorrect += 1;
+          else result.operations.push({
+            fileId: context.fileId, pageId: page.id, shapeId: layer.id, before, after
           });
+          if (inspected.invalid) {
+            result.styleConflicts += 1;
+            result.styleMetadataConflicts += 1;
+          } else if (managesStyle) {
+            const current = textStyleValues(layer);
+            if (rtl && current.direction === null) {
+              result.styleUnsupported += 1;
+              continue;
+            }
+            const planned = planManagedSection(metadata?.textStyle, "textStyle", current,
+              rtlTextStyle(current), rtl ? "rtl" : "baseline");
+            if (planned.conflict) result.styleConflicts += 1;
+            else if (planned.operation) result.styleOperations.push({
+              pageId: page.id, shapeId: layer.id, ...planned.operation
+            });
+          }
         }
       } catch (error) {
         result.failed += 1;
         console.error("Cannot inspect a text layer.");
       }
     }
+    if (pageOperation && (pageOperation.previous !== direction
+        || result.layoutOperations.length > layoutStart || result.styleOperations.length > styleStart)) {
+      result.pageOperations.push(pageOperation);
+    }
+    if (managedIssues(result) > failuresBefore) result.blockedPageIds.add(page.id);
   }
   return result;
 }
 
-function executeApply(context, plan) {
-  let changed = 0;
-  let conflicts = 0;
-  let historyFailed = false;
-  if (!plan.operations.length) return { changed, conflicts, historyFailed };
-  if (!contextStillMatches(context)) {
-    plan.failed += plan.operations.length;
-    return { changed, conflicts, historyFailed };
-  }
-  let historyId;
+function planTextDirection(pageId, layer, direction, result) {
   try {
-    historyId = penpot.history.undoBlockBegin();
+    if (!isValidId(layer.id)) {
+      result.failed += 1;
+    } else if (layer.direction === "mixed" || layer.align === "mixed") {
+      result.skipped += 1;
+    } else {
+      const { metadata, invalid } = inspectRtlMetadata(layer);
+      if (invalid) {
+        result.styleConflicts += 1;
+        result.styleMetadataConflicts += 1;
+        return;
+      }
+      const current = textStyleValues(layer);
+      if (current.direction === null) {
+        result.styleUnsupported += 1;
+        return;
+      }
+      if (current.direction === direction
+          && (!metadata?.textStyle || metadata.textStyle.active === "baseline")) return;
+      const planned = planManagedSection(metadata?.textStyle, "textStyle", current,
+        rtlTextStyle(current, true), direction);
+      if (planned.conflict) result.styleConflicts += 1;
+      else if (planned.operation) result.styleOperations.push({
+        pageId, shapeId: layer.id, ...planned.operation
+      });
+    }
   } catch (error) {
-    plan.failed += plan.operations.length;
-    console.error("Cannot start localization history.");
-    return { changed, conflicts, historyFailed: true };
+    recordManagedFailure(result, "style", "target");
+    console.error("Cannot plan text direction.");
   }
-  try {
-    const pages = new Map(context.pages.map(page => [page.id, page.proxy]));
-    for (const operation of plan.operations) {
+}
+
+function managedValues(shape, fields, kind, parentOrigin) {
+  const result = {};
+  for (const field of Object.keys(fields)) {
+    if (kind === "style") result[field] = shape[field];
+    else if (field === "flexDir") result[field] = shape.flex && shape.flex.dir;
+    else if (field === "flexAlignItems") result[field] = shape.flex && shape.flex.alignItems;
+    else if (field === "flexLeftPadding") result[field] = shape.flex && shape.flex.leftPadding;
+    else if (field === "flexRightPadding") result[field] = shape.flex && shape.flex.rightPadding;
+    else if (field === "parentOffsetX") {
+      const parentX = parentOrigin ?? shape.parent?.x;
+      const expectedOffset = fields[field];
+      result[field] = shape.x === parentX + expectedOffset ? expectedOffset : shape.x - parentX;
+    }
+    else if (["leftMargin", "rightMargin", "alignSelf"].includes(field)) {
+      result[field] = shape.layoutChild && shape.layoutChild[field];
+    } else result[field] = shape[field];
+  }
+  return result;
+}
+
+function setManagedValues(shape, values, kind, parentOrigin) {
+  for (const [field, value] of Object.entries(values)) {
+    if (kind === "style") shape[field] = value;
+    else if (field === "flexDir") shape.flex.dir = value;
+    else if (field === "flexAlignItems") shape.flex.alignItems = value;
+    else if (field === "flexLeftPadding") shape.flex.leftPadding = value;
+    else if (field === "flexRightPadding") shape.flex.rightPadding = value;
+    else if (field === "parentOffsetX") shape.x = parentOrigin + value;
+    else if (["leftMargin", "rightMargin", "alignSelf"].includes(field)) {
+      shape.layoutChild[field] = value;
+    } else shape[field] = value;
+  }
+}
+
+function managedIssues(plan) {
+  return plan.failed + plan.styleConflicts + plan.layoutConflicts + (plan.metadataConflicts || 0);
+}
+
+function executeManagedOperations(page, operations, kind, plan) {
+  let changed = 0;
+  let encounteredFailure = false;
+  const parentOrigins = new Map();
+  for (const operation of operations) {
+    try {
+      const shape = page.getShapeById(operation.shapeId);
+      if (!shape) {
+        plan.failed += 1;
+        continue;
+      }
+      const parentId = operation.metadata.parentId;
+      const parent = parentId ? shape.parent : null;
+      if (parentId && parent?.id !== parentId) {
+        plan.layoutConflicts += 1;
+        continue;
+      }
+      // Child writes can temporarily move a group's bounds. Anchor all siblings to its initial x.
+      if (parent && !parentOrigins.has(parentId)) parentOrigins.set(parentId, parent.x);
+      const parentOrigin = parentOrigins.get(parentId);
+      const current = managedValues(shape, operation.current, kind, parentOrigin);
+      if (!sameRecord(current, operation.current)) {
+        if (kind === "style") plan.styleConflicts += 1;
+        else plan.layoutConflicts += 1;
+        continue;
+      }
+      const sectionName = kind === "style" ? "textStyle" : "layout";
+      const pendingMetadata = {
+        ...operation.metadata,
+        active: `pending-${operation.metadata.active}`
+      };
       try {
-        const page = pages.get(operation.pageId);
-        const layer = page && page.getShapeById(operation.shapeId);
+        writeRtlMetadata(shape, sectionName, pendingMetadata);
+      } catch (error) {
+        recordManagedFailure(plan, kind, "metadata");
+        encounteredFailure = true;
+        continue;
+      }
+      let changedAny = false;
+      let propertyFailed = false;
+      if (!sameRecord(current, operation.target)) {
+        for (const [field, value] of Object.entries(operation.target)) {
+          try {
+            const fieldTarget = { [field]: value };
+            const fieldCurrent = managedValues(shape, fieldTarget, kind, parentOrigin);
+            if (sameRecord(fieldCurrent, fieldTarget)) continue;
+            setManagedValues(shape, fieldTarget, kind, parentOrigin);
+            if (!sameRecord(managedValues(shape, fieldTarget, kind, parentOrigin), fieldTarget)) {
+              throw new Error("Managed property readback failed.");
+            }
+            changedAny = true;
+          } catch (error) {
+            recordManagedFailure(plan, kind, field);
+            encounteredFailure = true;
+            propertyFailed = true;
+          }
+        }
+        if (changedAny) changed += 1;
+        if (!sameRecord(managedValues(shape, operation.target, kind, parentOrigin), operation.target)) {
+          if (!propertyFailed) recordManagedFailure(plan, kind, "target");
+          encounteredFailure = true;
+          continue;
+        }
+      }
+      try {
+        writeRtlMetadata(shape, sectionName, operation.metadata);
+      } catch (error) {
+        recordManagedFailure(plan, kind, "metadata");
+        encounteredFailure = true;
+      }
+    } catch (error) {
+      recordManagedFailure(plan, kind, "target");
+      encounteredFailure = true;
+    }
+  }
+  if (encounteredFailure) {
+    if (kind === "style") {
+      console.error(`Some RTL text style updates were skipped (${plan.styleFailed}).`);
+    } else {
+      const details = LAYOUT_FAILURE_REASONS
+        .filter(reason => plan.layoutFailureReasons[reason] > 0)
+        .map(reason => `${reason}: ${plan.layoutFailureReasons[reason]}`)
+        .join(", ");
+      console.error(`Some RTL layout updates were skipped (${details}).`);
+    }
+  }
+  return changed;
+}
+
+function executeMutation(context, plan, execution, executePage) {
+  const byPage = new Map(context.pages.map(page => [page.id, {
+    ...page, operations: [], styleOperations: [], layoutOperations: [], pageOperation: null
+  }]));
+  for (const key of ["operations", "styleOperations", "layoutOperations"]) {
+    for (const operation of plan[key]) byPage.get(operation.pageId)[key].push(operation);
+  }
+  for (const operation of plan.pageOperations) byPage.get(operation.pageId).pageOperation = operation;
+  const pages = [...byPage.values()].filter(page => page.pageOperation || page.operations.length
+    || page.styleOperations.length || page.layoutOperations.length);
+  if (!pages.length) return execution;
+  if (!contextStillMatches(context)) {
+    plan.failed += plan.operations.length + plan.styleOperations.length
+      + plan.layoutOperations.length + plan.pageOperations.length;
+    return execution;
+  }
+  const writePage = page => {
+    if (!isActivePage(context.fileId, page.id)) {
+      recordPageFailure(plan, page.id);
+      return;
+    }
+    let historyId;
+    try {
+      historyId = penpot.history.undoBlockBegin();
+      if (typeof historyId !== "symbol") throw new Error("Cannot start design history.");
+    } catch (error) {
+      plan.failed += page.operations.length + page.styleOperations.length
+        + page.layoutOperations.length + Number(Boolean(page.pageOperation));
+      execution.historyFailed = true;
+      console.error("Cannot start design history.");
+      return;
+    }
+    try {
+      executePage(page);
+    } finally {
+      try {
+        penpot.history.undoBlockFinish(historyId);
+      } catch (error) {
+        execution.historyFailed = true;
+        console.error("Cannot finish design history.");
+      }
+    }
+  };
+  // Penpot's undo transaction is shared with the workspace. Keep navigation outside it.
+  if (pages.some(page => page.id !== context.currentPageId)) {
+    return executeAcrossPages(context, pages, plan, writePage).then(() => execution);
+  }
+  writePage(pages[0]);
+  return execution;
+}
+
+function isActivePage(fileId, pageId) {
+  return penpot.currentFile?.id === fileId && penpot.currentPage?.id === pageId;
+}
+
+async function openMutationPage(pageId) {
+  let timeout;
+  try {
+    await Promise.race([
+      penpot.openPage(pageId),
+      new Promise((resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Page navigation timed out.")), 10000);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function executeAcrossPages(context, pages, plan, executePage) {
+  const originalPageId = context.currentPageId;
+  let activePageId = originalPageId;
+  try {
+    for (const page of pages) {
+      if (!isActivePage(context.fileId, activePageId)
+          || !penpot.currentFile.pages.some(candidate => candidate?.id === page.id)) {
+        recordPageFailure(plan, page.id);
+        continue;
+      }
+      if (page.id !== activePageId) {
+        try {
+          await openMutationPage(page.id);
+        } catch (error) {
+          recordPageFailure(plan, page.id);
+          continue;
+        }
+        if (!isActivePage(context.fileId, page.id)) {
+          recordPageFailure(plan, page.id);
+          continue;
+        }
+        activePageId = page.id;
+      }
+      executePage(page);
+    }
+  } finally {
+    if (activePageId !== originalPageId && isActivePage(context.fileId, activePageId)) {
+      try {
+        await openMutationPage(originalPageId);
+        if (!isActivePage(context.fileId, originalPageId)) throw new Error("Page changed.");
+      } catch (error) {
+        recordPageFailure(plan, originalPageId);
+      }
+    }
+  }
+}
+
+function executeApply(context, plan) {
+  const execution = { changed: 0, styled: 0, mirrored: 0, conflicts: 0, historyFailed: false };
+  return executeMutation(context, plan, execution, target => {
+    const { proxy: page, pageOperation } = target;
+    if (pageOperation) {
+      try {
+        if (readPageDirection(page) !== pageOperation.previous) {
+          throw new Error("Page direction changed.");
+        }
+        if (pageOperation.previous !== pageOperation.pending) {
+          writePageDirection(page, pageOperation.pending);
+        }
+      } catch (error) {
+        recordPageFailure(plan, target.id);
+        return;
+      }
+    }
+    for (const operation of target.operations) {
+      try {
+        const layer = page.getShapeById(operation.shapeId);
         if (!layer) {
           plan.failed += 1;
           continue;
         }
         if (layer.characters !== operation.before) {
-          conflicts += 1;
+          execution.conflicts += 1;
           continue;
         }
         layer.characters = operation.after;
@@ -348,36 +1235,50 @@ function executeApply(context, plan) {
           readbackFailed = true;
         }
         recordRecovery(operation, actualText);
-        if (!readbackFailed && actualText === operation.after) changed += 1;
+        if (!readbackFailed && actualText === operation.after) execution.changed += 1;
         else plan.failed += 1;
       } catch (error) {
         plan.failed += 1;
         console.error("Cannot update a text layer.");
       }
     }
-  } finally {
-    try {
-      penpot.history.undoBlockFinish(historyId);
-    } catch (error) {
-      historyFailed = true;
-      console.error("Cannot finish localization history.");
+    const issuesBefore = managedIssues(plan);
+    execution.styled += executeManagedOperations(page, target.styleOperations, "style", plan);
+    execution.mirrored += executeManagedOperations(page, target.layoutOperations, "layout", plan);
+    if (pageOperation && !plan.failedPageIds.has(target.id) && !plan.blockedPageIds.has(target.id)
+        && issuesBefore === managedIssues(plan)) {
+      try {
+        if (readPageDirection(page) !== pageOperation.pending) throw new Error("Page direction changed.");
+        writePageDirection(page, pageOperation.direction);
+      } catch (error) {
+        recordPageFailure(plan, target.id);
+      }
     }
-  }
-  return { changed, conflicts, historyFailed };
+  });
 }
 
-function handleApply(message) {
-  const replyType = "localization-result";
+async function handleApply(message) {
+  const switching = message.type === "switch-direction";
+  const replyType = switching ? "direction-result" : "localization-result";
   try {
-    const strings = validateTranslations(message.translations, message.language);
+    if (switching && (!isDirection(message.direction)
+        || message.scope === "page" && !isValidId(message.pageId))) {
+      throw new Error("Invalid direction or page context.");
+    }
+    const strings = switching ? null : validateTranslations(message.translations, message.language);
     const context = captureContext(message);
-    const plan = planApply(context, strings);
-    const execution = executeApply(context, plan);
+    const plan = planApply(context, strings, message.language, switching ? message.direction : null);
+    let execution = executeApply(context, plan);
+    if (execution.then) execution = await execution;
+    const state = inspectActiveRtlMetadata(context);
     penpot.ui.sendMessage({
       type: replyType,
       requestId: message.requestId,
       ok: true,
-      language: message.language,
+      ...(switching ? { direction: message.direction } : { language: message.language }),
+      rtl: plan.rtl,
+      layoutMirrored: state.layoutMirrored,
+      layoutStateComplete: state.complete,
       pageCount: plan.pageCount,
       tagged: plan.tagged,
       changed: execution.changed,
@@ -386,13 +1287,28 @@ function handleApply(message) {
       failed: plan.failed,
       failedPages: plan.failedPages,
       conflicts: execution.conflicts,
+      styled: execution.styled,
+      mirrored: execution.mirrored,
+      layoutSkipped: plan.layoutSkipped,
+      layoutUnsupported: plan.layoutUnsupported,
+      layoutSubtreesSkipped: plan.layoutSubtreesSkipped,
+      styleConflicts: plan.styleConflicts,
+      styleMetadataConflicts: plan.styleMetadataConflicts,
+      layoutConflicts: plan.layoutConflicts,
+      layoutMetadataConflicts: plan.layoutMetadataConflicts,
+      styleFailed: plan.styleFailed,
+      styleUnsupported: plan.styleUnsupported,
+      layoutFailed: plan.layoutFailed,
+      layoutFailureReasons: plan.layoutFailureReasons,
       historyFailed: execution.historyFailed,
-      restoreAvailable: hasRecovery(context.fileId),
+      restoreAvailable: hasRecovery(context.fileId) || state.restoreAvailable,
       missing: [...plan.missing].sort()
     });
   } catch (error) {
     console.error("Localization failed.");
     sendOperationError(replyType, error instanceof Error ? error.message : "Localization failed.", message.requestId);
+  } finally {
+    mutationPending = false;
   }
 }
 
@@ -404,75 +1320,137 @@ function planRestore(context) {
     targeted: 0,
     skipped: 0,
     conflicts: 0,
+    styleConflicts: 0,
+    styleMetadataConflicts: 0,
+    layoutConflicts: 0,
+    layoutMetadataConflicts: 0,
+    metadataConflicts: 0,
+    layoutSkipped: 0,
+    layoutUnsupported: 0,
+    layoutSubtreesSkipped: 0,
+    styleFailed: 0,
+    layoutFailed: 0,
+    layoutFailureReasons: Object.fromEntries(LAYOUT_FAILURE_REASONS.map(reason => [reason, 0])),
     missingTargets: 0,
     failed: 0,
-    operations: []
+    failedPages: 0,
+    failedPageIds: new Set(),
+    blockedPageIds: new Set(),
+    operations: [],
+    styleOperations: [],
+    layoutOperations: [],
+    pageOperations: []
   };
-  if (!fileJournal) return result;
-  const journalPages = context.scope === "file"
-    ? [...fileJournal.entries()]
-    : [[context.currentPageId, fileJournal.get(context.currentPageId)]];
-  for (const [pageId, pageJournal] of journalPages) {
-    if (!pageJournal) continue;
-    const page = pages.get(pageId);
-    if (!page) {
-      result.targeted += pageJournal.size;
-      result.missingTargets += pageJournal.size;
-      continue;
-    }
-    for (const [shapeId, entry] of pageJournal.entries()) {
-      result.targeted += 1;
-      try {
-        const layer = page.getShapeById(shapeId);
-        if (!layer) {
-          result.missingTargets += 1;
-          continue;
+  if (fileJournal) {
+    const journalPages = context.scope === "file"
+      ? [...fileJournal.entries()]
+      : [[context.currentPageId, fileJournal.get(context.currentPageId)]];
+    for (const [pageId, pageJournal] of journalPages) {
+      if (!pageJournal) continue;
+      const page = pages.get(pageId);
+      if (!page) {
+        result.targeted += pageJournal.size;
+        result.missingTargets += pageJournal.size;
+        continue;
+      }
+      for (const [shapeId, entry] of pageJournal.entries()) {
+        result.targeted += 1;
+        try {
+          const layer = page.getShapeById(shapeId);
+          if (!layer) {
+            result.missingTargets += 1;
+            continue;
+          }
+          const currentText = layer.characters;
+          if (currentText !== entry.lastWrittenText) {
+            result.conflicts += 1;
+          } else if (hasMixedTextStyle(layer)) {
+            result.skipped += 1;
+          } else {
+            result.operations.push({
+              fileId: context.fileId,
+              pageId,
+              shapeId,
+              before: currentText,
+              after: entry.originalText
+            });
+          }
+        } catch (error) {
+          result.failed += 1;
+          console.error("Cannot inspect a recovery target.");
         }
-        const currentText = layer.characters;
-        if (currentText !== entry.lastWrittenText) {
-          result.conflicts += 1;
-        } else if (hasMixedTextStyle(layer)) {
-          result.skipped += 1;
-        } else {
-          result.operations.push({
-            fileId: context.fileId,
-            pageId,
-            shapeId,
-            before: currentText,
-            after: entry.originalText
-          });
-        }
-      } catch (error) {
-        result.failed += 1;
-        console.error("Cannot inspect a recovery target.");
       }
     }
   }
+  for (const page of context.pages) {
+    const issuesBefore = managedIssues(result);
+    let shapes;
+    try {
+      shapes = allPageShapes(page.proxy);
+      const previous = readPageDirection(page.proxy);
+      if (previous) result.pageOperations.push({ pageId: page.id, previous });
+    } catch (error) {
+      recordPageFailure(result, page.id);
+      continue;
+    }
+    for (const shape of shapes) {
+      const inspected = inspectRtlMetadata(shape);
+      if (inspected.invalid) {
+        result.metadataConflicts += 1;
+        continue;
+      }
+      try {
+        const metadata = inspected.metadata;
+        for (const [sectionName, kind, destination] of [
+          ["textStyle", "style", result.styleOperations],
+          ["layout", "layout", result.layoutOperations]
+        ]) {
+          const section = metadata && metadata[sectionName];
+          if (!section || section.active === "baseline") continue;
+          if (section.parentId && section.parentId !== shape.parent?.id) {
+            result.layoutConflicts += 1;
+            continue;
+          }
+          const current = managedValues(shape, section.lastWritten, kind);
+          const planned = planManagedSection(section, sectionName, current,
+            section.rtlTarget, "baseline");
+          if (planned.conflict) {
+            if (kind === "style") result.styleConflicts += 1;
+            else result.layoutConflicts += 1;
+          } else if (planned.operation) {
+            destination.push({
+              pageId: page.id, shapeId: shape.id, ...planned.operation,
+              ...(kind === "layout" ? { depth: layoutDepth(shape) } : {})
+            });
+          }
+        }
+      } catch (error) {
+        result.failed += 1;
+        console.error("Cannot plan RTL recovery metadata.");
+      }
+    }
+    if (managedIssues(result) > issuesBefore) result.blockedPageIds.add(page.id);
+  }
+  result.layoutOperations.sort((left, right) => left.depth - right.depth);
   return result;
 }
 
+function layoutDepth(shape) {
+  const ancestors = new Set();
+  for (let parent = shape.parent; parent; parent = parent.parent) {
+    if (ancestors.has(parent.id)) throw new Error("Invalid layout hierarchy.");
+    ancestors.add(parent.id);
+  }
+  return ancestors.size;
+}
+
 function executeRestore(context, plan) {
-  let restored = 0;
-  let historyFailed = false;
-  if (!plan.operations.length) return { restored, historyFailed };
-  if (!contextStillMatches(context)) {
-    plan.failed += plan.operations.length;
-    return { restored, historyFailed };
-  }
-  let historyId;
-  try {
-    historyId = penpot.history.undoBlockBegin();
-  } catch (error) {
-    plan.failed += plan.operations.length;
-    console.error("Cannot start recovery history.");
-    return { restored, historyFailed: true };
-  }
-  try {
-    const pages = new Map(context.pages.map(page => [page.id, page.proxy]));
-    for (const operation of plan.operations) {
+  const execution = { restored: 0, stylesRestored: 0, layoutsRestored: 0, historyFailed: false };
+  return executeMutation(context, plan, execution, target => {
+    const { proxy: page, pageOperation } = target;
+    for (const operation of target.operations) {
       try {
-        const page = pages.get(operation.pageId);
-        const layer = page && page.getShapeById(operation.shapeId);
+        const layer = page.getShapeById(operation.shapeId);
         if (!layer) {
           plan.missingTargets += 1;
           continue;
@@ -487,7 +1465,7 @@ function executeRestore(context, plan) {
         }
         layer.characters = operation.after;
         if (layer.characters === operation.after) {
-          restored += 1;
+          execution.restored += 1;
           removeRecovery(operation.fileId, operation.pageId, operation.shapeId);
         } else {
           plan.failed += 1;
@@ -497,40 +1475,64 @@ function executeRestore(context, plan) {
         console.error("Cannot restore a text layer.");
       }
     }
-  } finally {
-    try {
-      penpot.history.undoBlockFinish(historyId);
-    } catch (error) {
-      historyFailed = true;
-      console.error("Cannot finish recovery history.");
+    const issuesBefore = managedIssues(plan);
+    execution.stylesRestored += executeManagedOperations(page, target.styleOperations, "style", plan);
+    execution.layoutsRestored += executeManagedOperations(page, target.layoutOperations, "layout", plan);
+    if (pageOperation && !plan.blockedPageIds.has(target.id) && issuesBefore === managedIssues(plan)) {
+      try {
+        if (readPageDirection(page) !== pageOperation.previous) throw new Error("Page direction changed.");
+        writePageDirection(page, "");
+      } catch (error) {
+        recordPageFailure(plan, target.id);
+      }
     }
-  }
-  return { restored, historyFailed };
+  });
 }
 
-function handleRestore(message) {
+async function handleRestore(message) {
   const replyType = "restore-result";
   try {
     const context = captureContext(message);
     const plan = planRestore(context);
-    const execution = executeRestore(context, plan);
+    let execution = executeRestore(context, plan);
+    if (execution.then) execution = await execution;
+    const state = inspectActiveRtlMetadata(context);
     penpot.ui.sendMessage({
       type: replyType,
       requestId: message.requestId,
       ok: true,
       pageCount: plan.pageCount,
+      failedPages: plan.failedPages,
       targeted: plan.targeted,
       restored: execution.restored,
+      stylesRestored: execution.stylesRestored,
+      layoutsRestored: execution.layoutsRestored,
+      layoutMirrored: state.layoutMirrored,
+      layoutStateComplete: state.complete,
       skipped: plan.skipped,
       conflicts: plan.conflicts,
+      styleConflicts: plan.styleConflicts,
+      styleMetadataConflicts: plan.styleMetadataConflicts,
+      layoutConflicts: plan.layoutConflicts,
+      layoutMetadataConflicts: plan.layoutMetadataConflicts,
+      metadataConflicts: plan.metadataConflicts,
+      layoutSkipped: plan.layoutSkipped,
+      layoutUnsupported: plan.layoutUnsupported,
+      layoutSubtreesSkipped: plan.layoutSubtreesSkipped,
+      styleFailed: plan.styleFailed,
+      layoutFailed: plan.layoutFailed,
+      layoutFailureReasons: plan.layoutFailureReasons,
       missingTargets: plan.missingTargets,
       failed: plan.failed,
       historyFailed: execution.historyFailed,
-      restoreAvailable: hasRecovery(context.fileId)
+      restoreAvailable: plan.failedPages > 0
+        || hasRecovery(context.fileId) || state.restoreAvailable
     });
   } catch (error) {
     console.error("Recovery failed.");
     sendOperationError(replyType, error instanceof Error ? error.message : "Recovery failed.", message.requestId);
+  } finally {
+    mutationPending = false;
   }
 }
 
@@ -542,9 +1544,25 @@ penpot.ui.onMessage((message) => {
   if (!message || !Number.isSafeInteger(message.requestId) || message.requestId < 1) return;
   if (message.type === "design-context-request") {
     handleDesignContext(message);
-  } else if (message.type === "apply-language") {
-    handleApply(message);
-  } else if (message.type === "restore-localization") {
-    handleRestore(message);
+  } else if (["apply-language", "switch-direction", "restore-localization"].includes(message.type)) {
+    const restore = message.type === "restore-localization";
+    if (mutationPending) {
+      const replyType = restore ? "restore-result"
+        : message.type === "switch-direction" ? "direction-result" : "localization-result";
+      sendOperationError(replyType, "Another design update is in progress.", message.requestId);
+      return;
+    }
+    mutationPending = true;
+    return restore ? handleRestore(message) : handleApply(message);
+  } else if (message.type === "recovery-status-request") {
+    handleRecoveryStatus(message);
   }
 });
+
+// The UI refreshes scope status without sending host proxies across the bridge.
+if (typeof penpot.on === "function") {
+  const refreshContext = () => penpot.ui.sendMessage({ type: "design-context-changed" });
+  penpot.on("pagechange", refreshContext);
+  penpot.on("filechange", refreshContext);
+  penpot.on("contentsave", refreshContext);
+}
