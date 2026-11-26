@@ -4,11 +4,20 @@ const { readFileSync } = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const html = readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const scriptSource = html.match(/<script src="([^"]+)"><\/script>\s*<\/body>/)?.[1];
 const pluginScript = readFileSync(path.join(__dirname, '..', 'plugin.js'), 'utf8');
 const scopeHtml = html.match(/<select id="scope">([\s\S]*?)<\/select>/)[1];
 const defaultScope = scopeHtml.match(/<option value="([^"]+)" selected>/)[1];
 let nextFixtureId = 0;
+
+test('HTML loads its UI script from the same directory at the root and under a static subpath', () => {
+  assert.ok(scriptSource, 'Expected a classic external script at the end of the body');
+  for (const directory of ['/', '/penpot-localization-plugin/']) {
+    const htmlUrl = new URL(`${directory}index.html`, 'https://example.test');
+    assert.equal(new URL(scriptSource, htmlUrl).href,
+      `https://example.test${directory}ui.js`);
+  }
+});
 
 async function ui(data, options = {}) {
   const elements = new Map();
@@ -139,7 +148,8 @@ async function ui(data, options = {}) {
     Option: function(text, value) { this.text = text; this.value = value; this.disabled = false; }, TextEncoder, TextDecoder,
     fetch: () => { throw new Error("Unexpected network request"); }
   });
-  vm.runInContext(script, context);
+  const scriptPath = path.join(__dirname, '..', scriptSource);
+  vm.runInContext(readFileSync(scriptPath, 'utf8'), context, { filename: scriptPath });
   await new Promise(resolve => setImmediate(resolve));
   const app = { elements, events, parent, messages, storageRequests, contextRequests,
     recoveryRequests, storage,
