@@ -17,7 +17,7 @@ Run the Node suite for plugin/UI/message changes, the Python suite for server ch
 | [UI](../tests/ui.test.cjs) | Shipped inline script and adapter together with DOM/Penpot/storage/history/plugin-data stubs and real Blob byte reads: startup/reopening, pre-read context capture, page/file navigation races, local imports, dynamic languages, invalid/canceled retention, limits/BOM/Unicode, malformed UTF-8 rejection, automatic/manual apply, RTL option persistence/reporting, durable style recovery, session text recovery, operation locks, source/text rendering, per-file save/forget, transport/storage failures, result validation, and stale/foreign/malformed replies. |
 | [Server](../tests/test_server.py) | Actual handler with in-memory HTTP connections: allowed assets, private/traversal/symlink rejection, query strings, HEAD, preflight, and headers. |
 
-GitHub Actions runs both commands without installing project dependencies. Remote CI execution has not been confirmed. These tests do not establish browser policy, Penpot layout/style/font behavior, or undo/restore correctness.
+GitHub Actions runs both commands on `ubuntu-latest` with Node.js 22 and Python 3.14, without installing project dependencies. The [test workflow](../.github/workflows/tests.yml) runs when a pull request is opened or receives new commits, and on pushes to `main`, including pull request merges. The local development server supports Python 3.9 and later. These tests do not establish browser policy, Penpot layout/style/font behavior, or undo/restore correctness.
 
 ## Optional Penpot compatibility checks
 
@@ -47,6 +47,14 @@ These checks can help investigate a reported problem or document compatibility w
 Record each run's date, revision, `penpot.version`, browser/OS versions, sanitized fixture, observations, and unresolved issues. Keep private design text and dictionaries out of fixtures and screenshots.
 
 ## Validation record
+
+### GitHub Actions triggers — 2026-11-26
+
+GitHub recorded successful runs when PR #1 [opened](https://github.com/ymka/penpot-localization-plugin/actions/runs/45815169398), [received a new commit](https://github.com/ymka/penpot-localization-plugin/actions/runs/45815567782), and [merged](https://github.com/ymka/penpot-localization-plugin/actions/runs/45816561763). The merge run checked out `33284de` from `main` under the previous `pull_request: closed` trigger. The local workflow revision uses the documented [branch-filtered push trigger](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#running-your-workflow-only-when-a-push-to-specific-branches-occurs) for updates to `main`. Remote validation of that revision is pending.
+
+### GitHub Actions runner compatibility — 2026-11-26
+
+The reported GitHub Actions run failed during Python 3.9 setup on Ubuntu 26.04. The workflow selects Python 3.14 on `ubuntu-latest`, matching the Python series available locally and in GitHub's Ubuntu 26.04 tool cache. On a local snapshot of the `main` base, all 79 mocked plugin/UI tests passed on Node.js 26.10.0 and all four in-memory HTTP tests passed on Python 3.14.7. [GitHub Ubuntu 26.04 runner image](https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2604-Readme.md#python)
 
 ### Unchecked English layout target after pending baseline — 2026-11-19
 

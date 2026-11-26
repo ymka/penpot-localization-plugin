@@ -2,6 +2,8 @@
 
 Read [project context](docs/PROJECT_CONTEXT.md) before making changes and follow the [coding standards](AGENTS.md#implementation-standards). Use [the release plan](docs/V0_1_0_PLAN.md) to select unfinished work.
 
+Follow the [branch naming convention](AGENTS.md#branch-naming) when creating a branch.
+
 Keep changes focused and dependency-light. Run [the relevant tests](docs/TESTING.md), add regression coverage for behavioral fixes, and describe which checks used mocks and which ran inside Penpot. Update documentation when behavior or decisions change.
 
 For bug reports, include the plugin revision, Penpot/browser versions, scope, expected result, and a minimal sanitized fixture. Use disposable designs while testing. Keep private dictionaries, credentials, and design content out of commits and reports.

@@ -1,5 +1,9 @@
 name: Tests
-on: [push, pull_request]
+on:
+  pull_request:
+    types: [opened, synchronize]
+  push:
+    branches: [main]
 permissions:
   contents: read
 jobs:
@@ -12,6 +16,6 @@ jobs:
           node-version: '22'
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.14'
       - run: node --test tests/*.test.cjs
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
