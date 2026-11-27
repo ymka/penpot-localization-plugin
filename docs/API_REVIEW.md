@@ -4,6 +4,7 @@ Initial documentation review 2026-11-14; file identity, storage, manifest, messa
 
 | Surface | Documented contract and integration note |
 | --- | --- |
+| Adapter loading | Penpot’s upstream sandbox evaluates the fetched manifest entry as a script using `compartment.evaluate(plugin.code)`. The contributor build combines the adapter sources into that one script. The checked-in output lets users install the plugin directly. Source checked on 2026-11-26. |
 | Manifest | Relative runtime assets require numeric schema `version: 2`; this is separate from a plugin release version. Rechecked 2026-11-26 against the Penpot creation guide. Penpot resolves the code URL from the served manifest location, so the local server can expose the contents of `plugin/` at the URL root while a static host can serve them under a subpath. |
 | `penpot.ui.open(name, url, options)` | URL string and optional dimensions. The plugin explicitly loads `index.html`. Rechecked 2026-11-26 against the Penpot creation guide and hosting FAQ. The UI runs in an iframe and its document loads the sibling `./ui.js` using a relative URL. Host both files together to support static subpaths. |
 | `ui.onMessage`, `ui.sendMessage` | Callbacks receive messages directly; retain plain payloads rather than another ecosystem's envelope. Rechecked 2026-11-17 for pre-read context capture: context, apply, and restore use plugin-defined positive numeric request IDs, echoed on every response. The UI correlates and validates results and locks conflicting actions while one context/mutation request is pending. These protocols add no host API or permission. |
@@ -28,6 +29,7 @@ Initial documentation review 2026-11-14; file identity, storage, manifest, messa
 ## Primary sources
 
 - [Create a plugin: manifest, messaging, and local loading](https://help.penpot.app/plugins/create-a-plugin/)
+- [Penpot sandbox implementation](https://github.com/penpot/penpot/blob/develop/plugins/libs/plugins-runtime/src/lib/create-sandbox.ts)
 - [Penpot interface: UI, current file/page, history](https://doc.plugins.penpot.app/interfaces/Penpot)
 - [File interface](https://doc.plugins.penpot.app/interfaces/File)
 - [LocalStorage interface and required permission](https://doc.plugins.penpot.app/interfaces/LocalStorage)
