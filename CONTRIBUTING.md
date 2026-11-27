@@ -6,6 +6,8 @@ Follow the [branch naming convention](AGENTS.md#branch-naming) when creating a b
 
 Keep changes focused and dependency-light. Run [the relevant tests](docs/TESTING.md), add regression coverage for behavioral fixes, and describe which checks used mocks and which ran inside Penpot. Update documentation when behavior or decisions change.
 
+Edit Penpot adapter code in [`src/`](src/). After changing those files, run `python3 scripts/build_plugin.py` and commit the regenerated [`plugin/plugin.js`](plugin/plugin.js) with the source changes. The build uses Python’s standard library. Run `python3 scripts/build_plugin.py --check` to verify the generated file without rewriting it.
+
 For bug reports, include the plugin revision, Penpot/browser versions, scope, expected result, and a minimal sanitized fixture. Use disposable designs while testing. Keep private dictionaries, credentials, and design content out of commits and reports.
 
 For a suspected vulnerability, avoid posting sensitive details in a public issue. Use GitHub private vulnerability reporting if the owner has enabled it; otherwise request a private contact without disclosing exploit details publicly.

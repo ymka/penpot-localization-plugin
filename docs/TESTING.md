@@ -5,11 +5,12 @@
 Use Node.js 22+ and Python 3.9+. From the repository root:
 
 ```sh
+python3 scripts/build_plugin.py --check
 node --test tests/*.test.cjs
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Run the Node suite for plugin/UI/message changes, the Python suite for server changes, and both for cross-cutting asset changes. No project dependencies need installation.
+After editing the adapter sources, regenerate the runtime with `python3 scripts/build_plugin.py` before running these checks. Run the Node suite for plugin/UI/message changes, the Python suite for server changes, and both for cross-cutting asset changes. No project dependencies need installation.
 
 | Suite | Boundary and coverage |
 | --- | --- |
@@ -17,7 +18,7 @@ Run the Node suite for plugin/UI/message changes, the Python suite for server ch
 | [UI](../tests/ui.test.cjs) | Shipped UI script referenced by the HTML and the adapter, with DOM/Penpot/storage/history/plugin-data stubs and real Blob byte reads. Covers script URL resolution at the root and under a static subpath, startup/reopening, pre-read context capture, page/file navigation races, local imports, dynamic languages, invalid/canceled retention, limits/BOM/Unicode, malformed UTF-8 rejection, automatic/manual apply, direction switching, page direction persistence and reporting, durable style recovery, session text recovery, operation locks, source/text rendering, per-file save/forget, transport/storage failures, result validation, and stale/foreign/malformed replies. |
 | [Server](../tests/test_server.py) | Actual handler with in-memory HTTP connections: allowed assets, private/traversal/symlink rejection, query strings, HEAD, preflight, and headers. |
 
-GitHub Actions runs both commands on `ubuntu-latest` with Node.js 22 and Python 3.14, without installing project dependencies. The [test workflow](../.github/workflows/tests.yml) runs when a pull request is opened or receives new commits, and on pushes to `main`, including pull request merges. The local development server supports Python 3.9 and later. These tests do not establish browser policy, Penpot layout/style/font behavior, or undo/restore correctness.
+GitHub Actions runs the build freshness check and both test suites on `ubuntu-latest` with Node.js 22 and Python 3.14, without installing project dependencies. The [test workflow](../.github/workflows/tests.yml) runs when a pull request is opened or receives new commits, and on pushes to `main`, including pull request merges. The local development server supports Python 3.9 and later. These tests do not establish browser policy, Penpot layout/style/font behavior, or undo/restore correctness.
 
 ## Optional Penpot compatibility checks
 
@@ -47,6 +48,14 @@ These checks can help investigate a reported problem or document compatibility w
 Record each run's date, revision, `penpot.version`, browser/OS versions, sanitized fixture, observations, and unresolved issues. Keep private design text and dictionaries out of fixtures and screenshots.
 
 ## Validation record
+
+### Adapter source split — 2026-11-27
+
+The contributor build regenerated the checked-in script byte for byte from a temporary copy of the sources. The freshness check rejected missing and stale output without writing it. Manifest entry resolution passed at the URL root and under a static subpath. JavaScript syntax, all 116 mocked plugin/UI tests, all four in-memory HTTP tests, and `git diff --check` passed. Live Penpot, deployed HTTPS hosting, and remote CI were not exercised.
+
+### Internal adapter modules — 2026-11-26
+
+`node --check plugin/plugin.js`, all 116 mocked plugin/UI tests, all four in-memory HTTP tests, and `git diff --check` passed. The mocked suite exercises saved-import validation, translation apply, direction transitions, partial-write recovery, and Restore through the shipped adapter. Live Penpot, deployed HTTPS hosting, and remote CI were not exercised.
 
 ### Plugin runtime directory — 2026-11-26
 
